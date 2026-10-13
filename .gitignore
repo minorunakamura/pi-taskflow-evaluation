@@ -1,0 +1,4 @@
+node_modules/
+coverage/
+.pi/
+.DS_Store

@@ -1,3 +1,4 @@
+import { collectChildren, childKey, mutableObservation } from "./children.js";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -39,6 +40,7 @@ import {
   uuidPattern,
   type Report,
   type Root,
+  type Child,
 } from "./saved.js";
 
 export interface CollectionResult {
@@ -76,7 +78,9 @@ function html(report: Report): string {
   return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(report.displayName)}</title><style>body{max-width:75rem;margin:2rem auto;padding:0 1rem;font-family:system-ui}pre{white-space:pre-wrap;overflow-wrap:anywhere}a:focus,summary:focus{outline:3px solid #369}section{border-top:1px solid #888;padding:1rem 0}</style></head><body><h1>Taskflow: ${escape(report.displayName)}</h1><p>品質・承認・完了の判定ではありません。取得範囲内の最新報告は実行終了を意味しません。</p><p>Collected: ${escape(report.collectedAt)} / ${escape(report.taskflowId)}</p><p>contentDigest: <code>${report.contentDigest}</code> — 最新 JSON との一致はこの HTML 単体では未確認。</p><nav aria-label="Report sections"><a href="#issues">Planning / Issues</a> · <a href="#roots">Root / child references</a> · <a href="#limits">取得不足・制限</a></nav><section id="issues"><h2>Planning / Issues</h2><h3>Planning</h3><ul>${report.planningSessionIds.map((sessionId) => `<li><a href="#root-${report.roots.findIndex((root) => root.sessionId === sessionId)}">${escape(sessionId)}</a></li>`).join("")}</ul><h3>Issues</h3><ul>${issues.map(({ issue, implementationSessionIds }, index) => `<li id="issue-${index}">${issue.kind === "github" ? `<a href="${escape(`https://${issue.host}/${issue.owner}/${issue.repo}/issues/${issue.number}`)}" rel="noreferrer">${escape(`${issue.owner}/${issue.repo}#${issue.number}`)}</a>` : escape(issue.path)}<ul>${implementationSessionIds.length ? implementationSessionIds.map((sessionId) => `<li><a href="#root-${report.roots.findIndex((root) => root.sessionId === sessionId)}">Implementation: ${escape(sessionId)}</a></li>`).join("") : "<li>実行記録が見つからない（未実施とは断定しない。quarantine の記録は通常集計から除外。）</li>"}</ul></li>`).join("")}</ul><p>実行記録が見つからない Issue は未実施とは断定しません。</p></section><section id="roots"><h2>Root / child references</h2><ul>${report.roots.map((root, index) => `<li><a href="#root-${index}">${escape(root.phase)}: ${escape(root.sessionId)}</a></li>`).join("")}</ul>${report.roots
     .map((root, index) => {
       const observations = report.observations.filter(
-        (o) => o.provenance.sessionId === root.sessionId,
+        (o) =>
+          o.provenance.sessionId === root.sessionId &&
+          !o.provenance.rootSessionId,
       );
       const quarantined = root.quarantine.length > 0;
       const rootLinks = proofLinks(observations);
@@ -106,13 +110,30 @@ function html(report: Report): string {
       ]
         .map(
           (kind) =>
-            `<h4>${escape(kind)}${kind === "report" ? " — 報告値（最新 ≠ 終了）" : kind === "child_reference" ? " — 参照のみ、本文未取得 W3" : ""}</h4>${observations
+            `<h4>${escape(kind)}${kind === "report" ? " — 報告値（最新 ≠ 終了）" : kind === "child_reference" ? " — Root 公開参照" : ""}</h4>${observations
               .filter((o) => o.kind === kind)
               .map(
                 (o) =>
                   `<details${quarantined ? "" : " open"}><summary>${escape(o.provenance.entryId)} / ${escape(o.provenance.field)}${o.key === root.latestReportKey ? " — 取得範囲内の最新報告" : ""}${o.shortened ? " — shortened" : ""}</summary><p>${escape(o.provenance.timestamp)} / acquired ${escape(o.provenance.collectedAt)}</p><pre>${escape(typeof o.value === "string" ? o.value : JSON.stringify(o.value, null, 2))}</pre></details>`,
               )
               .join("")}`,
+        )
+        .join("")}<h4>Direct children</h4>${(report.children ?? [])
+        .filter((c) => c.rootSessionId === root.sessionId)
+        .map(
+          (child, childIndex) =>
+            `<section id="child-${index}-${childIndex}"><h5>${escape(child.agent)} — ${escape(child.runId)} / index ${child.index}</h5><p>Wrapper run: ${escape(child.wrapperRunId)} / Child Session ID: ${escape(child.sessionId ?? "unknown")} / Parent: ${escape(child.parentProof)} / Source: ${escape(child.file ?? "reference only")} / ${escape(child.availability)}</p><p>${escape(child.warnings.join("; "))}</p><p>公開結果と子本文の出典は別です。Review / acceptance は報告値、process-terminal proof は成功を意味しません。Usage は重複加算しません。</p>${report.observations
+              .filter(
+                (o) =>
+                  o.provenance.rootSessionId === child.rootSessionId &&
+                  o.provenance.runId === child.runId &&
+                  o.provenance.index === child.index,
+              )
+              .map(
+                (o) =>
+                  `<details${quarantined || child.parentProof !== "confirmed" || child.warnings.includes("child_tree_navigation") || child.warnings.includes("fork_child_attribution_unknown") ? "" : " open"}><summary>${escape(o.kind)} / ${escape(o.provenance.source)} / ${escape(o.provenance.artifactKind ?? "child session")} / ${escape(o.provenance.entryId)} / ${escape(o.provenance.field)}${o.shortened ? " — shortened" : ""}</summary><p>${escape(o.provenance.file)} / ${escape(o.provenance.timestamp)} / acquired ${escape(o.provenance.collectedAt)}</p><pre>${escape(typeof o.value === "string" ? o.value : JSON.stringify(o.value, null, 2))}</pre></details>`,
+              )
+              .join("")}</section>`,
         )
         .join("")}</section>`;
     })
@@ -136,6 +157,7 @@ function merge(
   limits: Limits,
   candidate: ReturnType<typeof candidateList>["candidates"][number],
   membershipConflicts: ReturnType<typeof candidateList>["conflicts"],
+  budget: ReadBudget,
 ): Report {
   const selected = new Set([
     ...(candidate?.planningSessionIds ?? []),
@@ -223,6 +245,56 @@ function merge(
         ...new Set([...root.quarantine, "registration_conflict"]),
       ];
   }
+  const acquired = collectChildren(
+    live.runs.filter((run) => roots.has(run.sessionId)),
+    cwd,
+    sessionDir,
+    limits,
+    budget,
+  );
+  const children = new Map<string, Child>(
+    (old?.children ?? []).map((child) => [
+      childKey(child),
+      {
+        ...child,
+        availability: "missing_or_unread" as const,
+        warnings: [
+          ...child.warnings.filter((w) =>
+            [
+              "child_tree_navigation",
+              "fork_child_attribution_unknown",
+            ].includes(w),
+          ),
+          "source_missing_or_unread; preserved child evidence",
+        ],
+      },
+    ]),
+  );
+  for (const child of acquired.children) {
+    const previous = children.get(childKey(child));
+    child.sessionId ??= previous?.sessionId ?? null;
+    child.file ??= previous?.file ?? null;
+    if (
+      previous &&
+      child.sourceBytes < previous.sourceBytes &&
+      child.availability === "available"
+    )
+      child.availability = "shortened";
+    child.sourceBytes = Math.max(previous?.sourceBytes ?? 0, child.sourceBytes);
+    child.warnings = [
+      ...new Set([
+        ...(previous?.warnings.filter((w) =>
+          ["child_tree_navigation", "fork_child_attribution_unknown"].includes(
+            w,
+          ),
+        ) ?? []),
+        ...child.warnings,
+      ]),
+    ];
+    children.set(childKey(child), child);
+  }
+  for (const observation of acquired.observations)
+    retainObservation(observations, observation);
   const conflicts = new Set(old?.conflicts ?? []);
   for (const conflict of membershipConflicts)
     if (conflict.taskflowIds.includes(id))
@@ -231,6 +303,7 @@ function merge(
       );
   const values = new Map<string, Set<string>>();
   for (const observation of observations.values()) {
+    if (mutableObservation(observation)) continue;
     const digests = values.get(observation.key) ?? new Set<string>();
     digests.add(observation.sourceDigest);
     values.set(observation.key, digests);
@@ -255,6 +328,7 @@ function merge(
     scope: { cwd: resolve(cwd), sessionDir: resolve(sessionDir) },
     effectiveLimits: limits,
     roots: [...roots.values()],
+    children: [...children.values()],
     observations: [...observations.values()],
     ...reportReferences([...roots.values()], [...observations.values()]),
     conflicts: [...conflicts],
@@ -263,7 +337,7 @@ function merge(
       "Unrecorded tree navigation cannot be reconstructed.",
       "Latest report is not run completion; reports do not establish quality, approval or success.",
       "Missing records / Usage are unknown, not zero or not performed; scoped Usage is not a full total.",
-      "Child references and public results in Root logs only; child files/bodies are not acquired (W3). Tool-specific details are raw JSON observations, not Evaluation judgments.",
+      "Direct children from pi-subagents 0.77.0 public references only. Parent-unconfirmed, fork-attribution-unknown and nested bodies are not normal evidence. Process-terminal proof is not execution success. Artifacts may expire; arbitrary output overrides are not acquired.",
       "Unknown secrets, power-loss durability and stale HTML viewed alone cannot be guaranteed.",
     ],
     warnings: live.warnings.map(
@@ -273,6 +347,9 @@ function merge(
     contentDigest: "",
   };
   if (
+    acquired.children.some((child) =>
+      child.warnings.includes("known_secret_redaction_applied"),
+    ) ||
     old?.warnings.includes("known_secret_redaction_applied") ||
     live.runs.some((run) =>
       run.warnings.includes("known_secret_redaction_applied"),
@@ -286,6 +363,12 @@ function merge(
       cwd: redactText(report.scope.cwd),
       sessionDir: redactText(report.scope.sessionDir),
     },
+    children: report.children?.map((child) => ({
+      ...child,
+      file: child.file === null ? null : redactText(child.file),
+      agent: redactText(child.agent),
+      warnings: child.warnings.map(redactText),
+    })),
     roots: report.roots.map((root) => ({
       ...root,
       file: redactText(root.file),
@@ -445,6 +528,7 @@ export function collectReport(
       limits,
       candidate,
       membershipConflicts,
+      budget,
     );
     report.warnings.push(...result.warnings);
     report.contentDigest = reportDigest(report);

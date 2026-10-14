@@ -8,10 +8,11 @@ import {
   readSync,
   realpathSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, parse, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import {
+  contained,
   defaults,
   limitsSnapshot,
   issueKey,
@@ -30,6 +31,8 @@ import {
   sourceKey,
   validJson,
   validUsage,
+  validChildAccounting,
+  validProcessTerminal,
   type Observation,
 } from "./evidence.js";
 import type { ReadBudget, Run, Scan } from "./discovery.js";
@@ -40,7 +43,12 @@ const text = Type.String({ minLength: 1 });
 const strings = Type.Array(text);
 const provenanceSchema = Type.Object(
   {
-    source: Type.Literal("session"),
+    source: Type.Union([Type.Literal("session"), Type.Literal("artifact")]),
+    rootSessionId: Type.Optional(text),
+    runId: Type.Optional(text),
+    wrapperRunId: Type.Optional(text),
+    index: Type.Optional(Type.Integer({ minimum: 0 })),
+    artifactKind: Type.Optional(text),
     sessionId: text,
     entryId: text,
     field: text,
@@ -64,6 +72,7 @@ const observationSchema = Type.Object(
       Type.Literal("summary"),
       Type.Literal("context_edit"),
       Type.Literal("child_reference"),
+      Type.Literal("lifecycle"),
     ]),
     provenance: provenanceSchema,
     value: Type.Unknown(),
@@ -93,6 +102,30 @@ const rootSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const childSchema = Type.Object(
+  {
+    rootSessionId: text,
+    runId: text,
+    wrapperRunId: text,
+    index: Type.Integer({ minimum: 0 }),
+    agent: Type.String(),
+    sessionId: Type.Union([text, Type.Null()]),
+    file: Type.Union([text, Type.Null()]),
+    parentProof: Type.Union([
+      Type.Literal("confirmed"),
+      Type.Literal("unconfirmed"),
+      Type.Literal("conflict"),
+    ]),
+    availability: Type.Union([
+      Type.Literal("available"),
+      Type.Literal("missing_or_unread"),
+      Type.Literal("shortened"),
+    ]),
+    sourceBytes: Type.Integer({ minimum: 0 }),
+    warnings: strings,
+  },
+  { additionalProperties: false },
+);
 const reportSchema = Type.Object(
   {
     schemaVersion: Type.Literal(1),
@@ -110,6 +143,7 @@ const reportSchema = Type.Object(
       { additionalProperties: false },
     ),
     roots: Type.Array(rootSchema),
+    children: Type.Optional(Type.Array(childSchema)),
     observations: Type.Array(observationSchema),
     planningSessionIds: strings,
     issues: Type.Array(
@@ -127,6 +161,7 @@ const reportSchema = Type.Object(
 );
 export type Report = Static<typeof reportSchema>;
 export type Root = Report["roots"][number];
+export type Child = Static<typeof childSchema>;
 export class ReportError extends Error {
   constructor(
     public code: string,
@@ -176,6 +211,7 @@ export function safeRead(
   limits: Limits,
   budget: ReadBudget,
   privateFile = true,
+  onAppend?: () => void,
 ): string {
   requireSafePath(path, privateFile ? 0o600 : undefined);
   const before = lstatSync(path);
@@ -211,21 +247,52 @@ export function safeRead(
       offset += count;
       chunks.push(chunk.subarray(0, count));
     }
+    const content = Buffer.concat(chunks);
     const end = fstatSync(fd);
     const current = lstatSync(path);
     if (
-      end.size !== start.size ||
-      end.mtimeMs !== start.mtimeMs ||
-      end.ctimeMs !== start.ctimeMs ||
+      end.size < start.size ||
+      ((!onAppend || end.size === start.size) &&
+        (end.size !== start.size ||
+          end.mtimeMs !== start.mtimeMs ||
+          end.ctimeMs !== start.ctimeMs)) ||
       current.ino !== start.ino ||
       current.dev !== start.dev ||
       current.isSymbolicLink()
     )
       throw new ReportError("report_file_changed");
+    if (end.size > start.size && onAppend) {
+      let verified = 0;
+      while (verified < start.size) {
+        const buffer = Buffer.alloc(Math.min(65536, start.size - verified));
+        if (budget.bytes + buffer.length > limits.maxReadMiB * 1048576)
+          throw new ReportError(
+            "report_read_limit",
+            "maxReadMiB",
+            limits.maxReadMiB,
+          );
+        const count = readSync(fd, buffer, 0, buffer.length, verified);
+        budget.bytes += count;
+        if (
+          !count ||
+          !buffer
+            .subarray(0, count)
+            .equals(content.subarray(verified, verified + count))
+        )
+          throw new ReportError("report_file_changed");
+        verified += count;
+      }
+      const checked = fstatSync(fd);
+      if (
+        checked.size < end.size ||
+        checked.mtimeMs !== end.mtimeMs ||
+        checked.ctimeMs !== end.ctimeMs
+      )
+        throw new ReportError("report_file_changed");
+      onAppend();
+    }
     requireSafePath(path, privateFile ? 0o600 : undefined);
-    return new TextDecoder("utf-8", { fatal: true }).decode(
-      Buffer.concat(chunks),
-    );
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
   } finally {
     closeSync(fd);
   }
@@ -262,7 +329,12 @@ function validSavedLink(value: unknown, cwd: string): value is Link {
 }
 export function proofLinks(observations: Observation[]): Link[] {
   return observations.flatMap((o) =>
-    o.kind === "link" && Value.Check(linkSchema, o.value) ? [o.value] : [],
+    o.kind === "link" &&
+    o.provenance.source === "session" &&
+    !o.provenance.rootSessionId &&
+    Value.Check(linkSchema, o.value)
+      ? [o.value]
+      : [],
   );
 }
 export function reportReferences(roots: Root[], observations: Observation[]) {
@@ -312,6 +384,83 @@ export function reportReferences(roots: Root[], observations: Observation[]) {
 function validObservation(observation: Observation): boolean {
   const field = observation.provenance.field;
   const value = observation.value;
+  if (observation.provenance.source === "artifact") {
+    const kind = observation.provenance.artifactKind;
+    const leaf = field.split(".").at(-1);
+    if (kind === "transcript") {
+      if (!/^line\.[0-9]+\./.test(field)) return false;
+      return validObservation({
+        ...observation,
+        provenance: {
+          ...observation.provenance,
+          source: "session",
+          field: field.replace(/^line\.[0-9]+\./, ""),
+        },
+      });
+    }
+    if (kind === "session-header")
+      return (
+        field === "header" &&
+        observation.kind === "child_reference" &&
+        record(value) &&
+        value.version === 3 &&
+        typeof value.id === "string" &&
+        typeof value.cwd === "string" &&
+        (value.parentSession === undefined ||
+          typeof value.parentSession === "string")
+      );
+    if (kind === "output" || kind === "input")
+      return (
+        field === "text" &&
+        observation.kind === (kind === "output" ? "report" : "request") &&
+        typeof value === "string"
+      );
+    if (kind === "archive")
+      return (
+        /^entries\.[0-9]+\.text$/.test(field) &&
+        observation.kind === "report" &&
+        typeof value === "string"
+      );
+    if (kind === "process-terminal")
+      return (
+        field === "processTerminal" &&
+        observation.kind === "lifecycle" &&
+        validProcessTerminal(value)
+      );
+    if (
+      !["public-result", "metadata", "status", "replay", "result"].includes(
+        kind ?? "",
+      )
+    )
+      return false;
+    if (observation.kind === "usage") return validChildAccounting(value, field);
+    if (observation.kind === "exit")
+      return leaf === "exitCode" && Number.isSafeInteger(value);
+    if (observation.kind === "request")
+      return leaf === "task" && typeof value === "string";
+    if (observation.kind === "report")
+      return (
+        ["finalOutput", "result"].includes(leaf ?? "") &&
+        typeof value === "string"
+      );
+    if (observation.kind === "lifecycle")
+      return ["startedAt", "lastUpdate", "endedAt", "durationMs"].includes(
+        leaf ?? "",
+      )
+        ? typeof value === "number" && Number.isFinite(value) && value >= 0
+        : ["state", "status"].includes(leaf ?? "")
+          ? typeof value === "string"
+          : leaf === "acceptance"
+            ? record(value) && validJson(value)
+            : [
+                "success",
+                "stopped",
+                "interrupted",
+                "timedOut",
+                "outputPartial",
+              ].includes(leaf ?? "") && typeof value === "boolean";
+    return false;
+  }
   switch (observation.kind) {
     case "link":
       return field === "data";
@@ -335,7 +484,7 @@ function validObservation(observation: Observation): boolean {
       );
     case "usage":
       return (
-        /^(?:message\.usage\.(?:root_assistant|tool_nested)|(?:compaction|branch_summary)\.usage|usage\..+)$/.test(
+        /^(?:message\.usage\.(?:root_assistant|child_assistant|tool_nested)|(?:compaction|branch_summary)\.usage|usage\..+)$/.test(
           field,
         ) && validUsage(value)
       );
@@ -356,9 +505,10 @@ function validObservation(observation: Observation): boolean {
             typeof value.name === "string" &&
             record(value.arguments);
     case "tool_result":
-      return field === "message.details"
+      return ["message.details", "custom.details"].includes(field)
         ? validJson(value)
-        : /^message\.content\.[0-9]+\.text$/.test(field)
+        : field === "custom.content" ||
+            /^(?:message|custom)\.content\.[0-9]+\.text$/.test(field)
           ? typeof value === "string"
           : field === "message.tool"
             ? record(value) &&
@@ -387,6 +537,82 @@ function validObservation(observation: Observation): boolean {
     default:
       return false;
   }
+}
+function validChildProvenance(
+  o: Observation,
+  child: Child,
+  root: Root,
+): boolean {
+  const p = o.provenance;
+  if (
+    p.rootSessionId !== root.sessionId ||
+    p.runId !== child.runId ||
+    p.index !== child.index ||
+    !isAbsolute(p.file) ||
+    resolve(p.file) !== p.file ||
+    p.file.includes("\\") ||
+    p.file.includes("\0")
+  )
+    return false;
+  if (p.source === "session")
+    return (
+      p.artifactKind === undefined &&
+      p.file.endsWith(".jsonl") &&
+      contained(root.file.slice(0, -6), p.file) &&
+      /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(p.sessionId) &&
+      o.kind !== "link"
+    );
+  if (
+    p.sessionId !== root.sessionId ||
+    typeof p.wrapperRunId !== "string" ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(p.wrapperRunId)
+  )
+    return false;
+  const wrapperRunId = p.wrapperRunId;
+  const kind = p.artifactKind;
+  if (kind === "session-header")
+    return (
+      p.file.endsWith(".jsonl") && contained(root.file.slice(0, -6), p.file)
+    );
+  if (kind === "public-result")
+    return (
+      p.file === root.file &&
+      /^(?:message|custom)\.details\.(?:.+\.)?(?:task|finalOutput|result|usage|exitCode|state|status|success|stopped|interrupted|timedOut|outputPartial|acceptance|totalTokens|totalCost|startedAt|lastUpdate|endedAt|durationMs)$/.test(
+        p.field,
+      )
+    );
+  if (kind === "status" || kind === "process-terminal")
+    return (
+      basename(p.file) === `${kind}.json` &&
+      basename(dirname(p.file)) === wrapperRunId &&
+      basename(dirname(dirname(p.file))) === "async-subagent-runs"
+    );
+  if (kind === "replay" || kind === "archive" || kind === "result")
+    return (
+      basename(p.file) === `${wrapperRunId}.json` &&
+      basename(dirname(p.file)) ===
+        (kind === "replay"
+          ? "completion-replay"
+          : kind === "archive"
+            ? "output-archives"
+            : "async-subagent-results")
+    );
+  const suffix = {
+    metadata: "_meta.json",
+    transcript: "_transcript.jsonl",
+    output: "_output.md",
+    input: "_input.md",
+  }[kind ?? ""];
+  const agent = child.agent.replace(/[^\w.-]/g, "_");
+  return (
+    !!suffix &&
+    !!agent &&
+    [
+      `${child.runId}_${agent}${suffix}`,
+      `${child.runId}_${agent}_${child.index}${suffix}`,
+    ].includes(basename(p.file)) &&
+    ["subagent-artifacts", "artifacts"].includes(basename(dirname(p.file)))
+  );
 }
 export function parseReport(
   input: string,
@@ -422,6 +648,28 @@ export function parseReport(
   const roots = new Map(value.roots.map((root) => [root.sessionId, root]));
   if (roots.size !== value.roots.length)
     throw new ReportError("invalid_report_identity");
+  const childKeys = new Set<string>();
+  for (const child of value.children ?? []) {
+    const root = roots.get(child.rootSessionId);
+    const key = JSON.stringify([child.rootSessionId, child.runId, child.index]);
+    if (
+      !root ||
+      childKeys.has(key) ||
+      !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(child.runId) ||
+      !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(
+        child.wrapperRunId,
+      ) ||
+      !Number.isSafeInteger(child.index) ||
+      !Number.isSafeInteger(child.sourceBytes) ||
+      (child.file !== null &&
+        (!isAbsolute(child.file) ||
+          child.file !== resolve(child.file) ||
+          !contained(root.file.slice(0, -6), child.file) ||
+          !child.file.endsWith(".jsonl")))
+    )
+      throw new ReportError("invalid_report_identity");
+    childKeys.add(key);
+  }
   const keys = new Set<string>();
   for (const root of value.roots) {
     if (
@@ -435,11 +683,24 @@ export function parseReport(
   }
   for (const observation of value.observations) {
     const p = observation.provenance;
-    const root = roots.get(p.sessionId);
+    const root = roots.get(p.rootSessionId ?? p.sessionId);
+    const child = value.children?.find(
+      (c) =>
+        c.rootSessionId === p.rootSessionId &&
+        c.runId === p.runId &&
+        c.index === p.index,
+    );
     const identity = `${observation.key}:${observation.sourceDigest}`;
     if (
       !root ||
-      p.file !== root.file ||
+      (p.rootSessionId
+        ? !child || !validChildProvenance(observation, child, root)
+        : p.source !== "session" ||
+          p.file !== root.file ||
+          p.runId !== undefined ||
+          p.wrapperRunId !== undefined ||
+          p.index !== undefined ||
+          p.artifactKind !== undefined) ||
       sourceKey(p) !== observation.key ||
       !Number.isFinite(Date.parse(p.timestamp)) ||
       !Number.isFinite(Date.parse(p.collectedAt)) ||
@@ -465,7 +726,12 @@ export function parseReport(
       hash(observation.value) !== observation.sourceDigest
     )
       throw new ReportError("invalid_report_evidence");
-    if (observation.kind === "usage" && !validUsage(observation.value))
+    if (
+      observation.kind === "usage" &&
+      !(p.source === "artifact" && p.artifactKind !== "transcript"
+        ? validChildAccounting(observation.value, p.field)
+        : validUsage(observation.value))
+    )
       throw new ReportError("invalid_report_evidence");
     if (observation.kind === "exit" && !Number.isSafeInteger(observation.value))
       throw new ReportError("invalid_report_evidence");
@@ -484,7 +750,9 @@ export function parseReport(
   for (const root of value.roots) {
     const links = proofLinks(
       value.observations.filter(
-        (o) => o.provenance.sessionId === root.sessionId,
+        (o) =>
+          o.provenance.sessionId === root.sessionId &&
+          !o.provenance.rootSessionId,
       ),
     );
     if (
@@ -595,7 +863,9 @@ export function withSaved(scan: Scan, reports: Report[], failed = false): Scan {
   for (const report of reports)
     for (const root of report.roots) {
       const observations = report.observations.filter(
-        (o) => o.provenance.sessionId === root.sessionId,
+        (o) =>
+          o.provenance.sessionId === root.sessionId &&
+          !o.provenance.rootSessionId,
       );
       const links = proofLinks(observations);
       const previous = runs.get(root.sessionId);

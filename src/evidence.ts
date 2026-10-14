@@ -3,7 +3,12 @@ import { Value } from "typebox/value";
 import { customType, linkSchema, type Limits, type Link } from "./contracts.js";
 
 export interface Provenance {
-  source: "session";
+  source: "session" | "artifact";
+  rootSessionId?: string;
+  runId?: string;
+  wrapperRunId?: string;
+  index?: number;
+  artifactKind?: string;
   sessionId: string;
   entryId: string;
   field: string;
@@ -23,7 +28,8 @@ export interface Observation {
     | "usage"
     | "summary"
     | "context_edit"
-    | "child_reference";
+    | "child_reference"
+    | "lifecycle";
   provenance: Provenance;
   value: unknown;
   sourceDigest: string;
@@ -51,7 +57,21 @@ export function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 export function sourceKey(p: Provenance): string {
-  return JSON.stringify([p.source, p.sessionId, p.entryId, p.field]);
+  return JSON.stringify(
+    p.rootSessionId
+      ? [
+          p.source,
+          p.rootSessionId,
+          p.runId,
+          p.index,
+          p.sessionId,
+          p.artifactKind,
+          p.file,
+          p.entryId,
+          p.field,
+        ]
+      : [p.source, p.sessionId, p.entryId, p.field],
+  );
 }
 export function redactText(text: string): string {
   return text
@@ -145,10 +165,134 @@ export function validUsage(value: unknown): boolean {
     )
   );
 }
+export function validChildUsage(value: unknown): boolean {
+  return (
+    record(value) &&
+    ["input", "output", "cacheRead", "cacheWrite", "cost", "turns"].every(
+      (key) =>
+        typeof value[key] === "number" &&
+        Number.isFinite(value[key]) &&
+        value[key] >= 0,
+    )
+  );
+}
+export function validProcessTerminal(value: unknown): boolean {
+  if (
+    !record(value) ||
+    value.version !== 1 ||
+    typeof value.runId !== "string" ||
+    typeof value.runnerProcessInstanceId !== "string" ||
+    !value.runnerProcessInstanceId ||
+    !["pending", "not-started", "observed", "unknown"].includes(
+      String(value.state),
+    )
+  )
+    return false;
+  if (
+    value.resumeDisposition !== undefined &&
+    (typeof value.resumeDisposition !== "string" ||
+      !["resumable", "non-resumable", "unavailable"].includes(
+        value.resumeDisposition,
+      ))
+  )
+    return false;
+  if (value.state === "unknown" && typeof value.reason !== "string")
+    return false;
+  if (
+    value.state === "observed" &&
+    (typeof value.observedAt !== "number" ||
+      !Number.isFinite(value.observedAt) ||
+      !Array.isArray(value.instances))
+  )
+    return false;
+  return (
+    value.instances === undefined ||
+    (Array.isArray(value.instances) &&
+      value.instances.every(
+        (instance) =>
+          record(instance) &&
+          ["runner", "pi-writer"].includes(String(instance.kind)) &&
+          typeof instance.processInstanceId === "string" &&
+          typeof instance.closeObservedAt === "number" &&
+          Number.isFinite(instance.closeObservedAt) &&
+          (instance.exitCode === null ||
+            Number.isSafeInteger(instance.exitCode)) &&
+          (instance.signal === null || typeof instance.signal === "string"),
+      ))
+  );
+}
+export function validChildAccounting(value: unknown, field: string): boolean {
+  if (field.split(".").at(-1) === "totalCost")
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+  if (field.split(".").at(-1) === "totalTokens")
+    return (
+      record(value) &&
+      ["input", "output", "total"].every(
+        (k) =>
+          typeof value[k] === "number" &&
+          Number.isFinite(value[k]) &&
+          value[k] >= 0,
+      ) &&
+      ["window", "windowPeak"].every(
+        (k) =>
+          value[k] === undefined ||
+          (typeof value[k] === "number" &&
+            Number.isFinite(value[k]) &&
+            value[k] >= 0),
+      )
+    );
+  return field.split(".").at(-1) === "usage" && validChildUsage(value);
+}
 export function cleanLink(link: Link): Link {
   return link.operation === "begin_planning"
     ? { ...link, displayName: redactText(link.displayName) }
     : link;
+}
+export function observe(
+  kind: Observation["kind"],
+  input: unknown,
+  provenance: Provenance,
+  limits: Limits,
+  warnings: string[],
+): Observation | undefined {
+  if (!validJson(input)) {
+    warnings.push(
+      `unsupported_evidence:${provenance.entryId}:${provenance.field}`,
+    );
+    return undefined;
+  }
+  const value =
+    kind === "link" && Value.Check(linkSchema, input)
+      ? cleanLink(input)
+      : redact(input);
+  if (JSON.stringify(value) !== JSON.stringify(input))
+    warnings.push("known_secret_redaction_applied");
+  const sourceDigest = hash(value);
+  let shortened = false;
+  const clip = (item: unknown): unknown => {
+    if (typeof item === "string") {
+      const bytes = Buffer.from(item);
+      if (bytes.length <= limits.maxExcerptKiB * 1024) return item;
+      shortened = true;
+      let end = limits.maxExcerptKiB * 1024;
+      while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+      return bytes.subarray(0, end).toString("utf8");
+    }
+    if (Array.isArray(item)) return item.map(clip);
+    if (record(item))
+      return Object.fromEntries(
+        Object.entries(item).map(([key, nested]) => [key, clip(nested)]),
+      );
+    return item;
+  };
+  return {
+    key: sourceKey(provenance),
+    kind,
+    provenance,
+    value: kind === "link" ? value : clip(value),
+    sourceDigest,
+    shortened,
+  };
 }
 export function collectEntry(
   entry: Record<string, unknown>,
@@ -159,51 +303,22 @@ export function collectEntry(
   warnings: string[],
 ) {
   const add = (kind: Observation["kind"], field: string, input: unknown) => {
-    if (!validJson(input)) {
-      warnings.push(`unsupported_evidence:${String(entry.id)}:${field}`);
-      return;
-    }
-    const value =
-      kind === "link" && Value.Check(linkSchema, input)
-        ? cleanLink(input)
-        : redact(input);
-    if (JSON.stringify(value) !== JSON.stringify(input))
-      warnings.push("known_secret_redaction_applied");
-    const sourceDigest = hash(value);
-    let shortened = false;
-    const clip = (item: unknown): unknown => {
-      if (typeof item === "string") {
-        const bytes = Buffer.from(item);
-        if (bytes.length <= limits.maxExcerptKiB * 1024) return item;
-        shortened = true;
-        let end = limits.maxExcerptKiB * 1024;
-        while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
-        return bytes.subarray(0, end).toString("utf8");
-      }
-      if (Array.isArray(item)) return item.map(clip);
-      if (record(item))
-        return Object.fromEntries(
-          Object.entries(item).map(([key, nested]) => [key, clip(nested)]),
-        );
-      return item;
-    };
-    const provenance: Provenance = {
-      source: "session",
-      sessionId,
-      entryId: String(entry.id),
-      field,
-      file,
-      timestamp: String(entry.timestamp),
-      collectedAt: new Date().toISOString(),
-    };
-    observations.push({
-      key: sourceKey(provenance),
+    const observation = observe(
       kind,
-      provenance,
-      value: kind === "link" ? value : clip(value),
-      sourceDigest,
-      shortened,
-    });
+      input,
+      {
+        source: "session",
+        sessionId,
+        entryId: String(entry.id),
+        field,
+        file,
+        timestamp: String(entry.timestamp),
+        collectedAt: new Date().toISOString(),
+      },
+      limits,
+      warnings,
+    );
+    if (observation) observations.push(observation);
   };
   const addUsage = (value: unknown, field: string) => {
     if (validUsage(value) && record(value) && record(value.cost))
@@ -280,6 +395,15 @@ export function collectEntry(
       entry.data.originSessionId === sessionId
     )
       add("link", "data", entry.data);
+  } else if (
+    entry.type === "custom_message" &&
+    entry.customType === "subagent-notify"
+  ) {
+    texts(entry.content, "tool_result", "custom.content", true);
+    if (record(entry.details) && Array.isArray(entry.details.runs))
+      add("tool_result", "custom.details", entry.details);
+    else
+      warnings.push(`unsupported_evidence:${String(entry.id)}:custom.details`);
   } else if (entry.type === "message") {
     const message = entry.message;
     if (

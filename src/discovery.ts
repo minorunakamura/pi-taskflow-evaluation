@@ -52,7 +52,7 @@ export interface Scan {
 export interface ReadBudget {
   bytes: number;
 }
-const entryTypes = new Set([
+export const sessionEntryTypes = new Set([
   "message",
   "model_change",
   "thinking_level_change",
@@ -190,7 +190,7 @@ export function readRun(
       }
       if (foreign) return;
       if (
-        !entryTypes.has(String(entry.type)) ||
+        !sessionEntryTypes.has(String(entry.type)) ||
         !text(entry.id) ||
         !text(entry.timestamp) ||
         !Number.isFinite(Date.parse(entry.timestamp)) ||

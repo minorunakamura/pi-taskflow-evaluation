@@ -1,11 +1,11 @@
 ---
 name: taskflow-evaluation
-description: Taskflow の確認済み Planning/Issue 参照を optional に通知し、手動で Root の出典付き JSON/HTML レポートを集計する。関連付け、候補一覧、レポート・再集計を求められたときに使う。品質判定・承認・完了認定は行わない。
+description: Taskflow の確認済み Planning/Issue 参照を optional に通知し、手動で Root / 直接子の出典付き JSON/HTML レポートを集計する。関連付け、候補一覧、レポート・再集計を求められたときに使う。品質判定・承認・完了認定は行わない。
 ---
 
 # Taskflow Evaluation
 
-`taskflow_evaluation_link` と `/taskflow-evaluate` を使う。子は明示参照だけで、本文 / Artifact 取得（W3）、隣接 Taskflow Skill 通知接点（W4）は未実装。詳細な導入・設定・安全性契約はこの Skill directory から `../../README.md` を読む。
+`taskflow_evaluation_link` と `/taskflow-evaluate` を使う。Root の公開明示参照から親・Artifact を検証できる直接子の本文 / 結果を取得する（pi-subagents 0.77.0）。nested / 任意 output override は対象外。隣接 Taskflow Skill 通知接点（W4）は未実装。詳細な導入・設定・安全性契約はこの Skill directory から `../../README.md` を読む。
 
 ## optional 通知
 
@@ -41,12 +41,23 @@ receipt の target (`taskflowId`)、files、digest、warnings / errorCode / resu
 
 - 同じ Session は更新、同じ Issue の別 Session は別実行。未集計の中間実行も後で取り込める。
 - request / assistant の報告 / Tool 観測 / unknown を区別する。READY_FOR_MERGE 等の文章は報告値であり承認代行ではない。取得範囲内の最新報告は実行終了ではない。構造化 exitCode がある場合だけ終了値を引用し、isError=false / 成功文を0に置換しない。
-- Usage は Root assistant / Tool nested / compaction / usage entry の出典と範囲別。欠損は未知で、総合計へ加算しない。子の runId / asyncId / path 等は参照のみ、本文未取得。
+- Usage は Root assistant / Tool nested / compaction / usage entry の出典と範囲別。欠損は未知で、総合計へ加算しない。子・wrapper の Usage も出典 scope ごとに表示し、Root Tool Usage と重複加算しない。Pi Usage と pi-subagents の cost:number / turns を混同しない。
 - ToolResult.details の JSON-safe な構造（Review / 承認結果を含む）を raw Tool 観測として保存し、entry / toolCallId / Tool 名で依頼・結果を辿る。Tool-specific schema を意味判断せず、Evaluation が approved を認定したとは説明しない。過度に深い・非 JSON の詳細は取得不足。
 - system prompt / thinking / signatures / image payload は保存しない。非対応の実使用 field は取得不足を示し、有効な明示所属まで拒否しない。
 - immutable な出典キー＋値を dedup し、改変値は両方と conflict を保持する。原ログ消失・短縮で保存証拠を削除せず、今回の availability を別に見直す。
 - 正常な取得で保存した tree quarantine は短縮・消失で通常成果・Review・承認集計へ戻さない。duplicate ID / parent 欠損等で取得未完了なら検出理由と未更新を receipt に表示し、旧ペアを維持する。未更新操作の観測を独自復旧状態として保存しない。
 - 一意性は限定 scope 内だけで、scope 外の矛盾・未記録 navigation は未知。
+
+### 直接子の読み方と取得限界
+
+対象を選んだ集計は `subagent` / `bg_wait` の公開 details と `subagent-notify` の details.runs から直接子だけを読む。`--list` は子 Artifact を読まない。foreground wrapper runId / 安定した results[].index、workflow child runId、子 Session ID、file path を分け、HTML の Direct children と JSON children / provenance から Agent・依頼・結果・Review の出典を辿る。wrapper の値を results row の field に付け替えない。Review / acceptance は報告であり、Evaluation が承認したとは説明しない。
+
+- 本文は metadata.parentSessionId ↔ Root ID、または child header.parentSession ↔ 検証済み Root file path で直接親を確認する。ID と path を代用しない。双方欠損は親未確認、両存在矛盾は conflict とし、通常子本文と公開結果を区別する。
+- fork の親継承 prefix は確認できる entry ID / 観測値で除外する。帰属不明や検出した tree の本文を通常成果へ混ぜない。Session が取得できないときの transcript は、親確認済みの非 fork 範囲だけの fallback。
+- 対応は Pi Session v3、0.77.0 の version field のない metadata、lifecycle status version 3、公開 process-terminal proof / completion replay / output archive / transcript version 1、one-shot result、managed output。process-terminal proof は成功とは別。status の変化は観測値であり、値の変化だけで immutable conflict / 成功を認定しない。
+- 現在 Session directory の参照子 Session / subagent-artifacts、固定 cwd の .pi/subagents/artifacts、現在 environment の user-scoped temp 公開 layout に限定する。run folder を wrapper ID と推測せず公開 sessionFile を使い、任意参照 path を許可 root に追加しない。過去 override / 独自 root / nested / 任意 output override を探索しない。Artifact 種別・identity・schema / version・symlink / regular file / fstat を検証する。
+- 消失・期限切れ replay・短縮・truncation・未完行・非対応 field・上限は取得不足と伝える。成功や Usage 0へ置換しない。有効な Root link proof は本文非対応だけで拒否せず、子の記録を Root 所属証拠に昇格させない。既存 W2 schemaVersion 1 を維持し、独自 pending / 復元再解決を作らない。
+- 子にも共通 read / file / line / excerpt / record / report 上限と maxChildrenPerRoot、秘匿化・安全保存を適用する。Session / transcript の追記後部分は次回の利用者の再集計へ送る。原ログ・Artifact を変更せず、新しいモデル呼出しや collector を追加しない。
 
 ## 設定・機密性・復旧
 

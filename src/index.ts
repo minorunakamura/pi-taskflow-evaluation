@@ -303,7 +303,7 @@ export default function taskflowEvaluation(pi: ExtensionAPI) {
   });
   pi.registerCommand("taskflow-evaluate", {
     description:
-      "Select a Taskflow and collect read-only Root evidence into private JSON/HTML reports; --list never writes reports.",
+      "Select a Taskflow and collect read-only Root / direct-child evidence into private JSON/HTML reports; --list never writes reports.",
     async handler(args, ctx) {
       let receipt: object;
       try {
@@ -360,7 +360,7 @@ export default function taskflowEvaluation(pi: ExtensionAPI) {
             limitations: [
               "Uniqueness is only within current cwd/top-level Session directory; outside-scope conflicts are unknown.",
               "Unrecorded tree navigation cannot be reconstructed.",
-              "Child bodies (W3) and Taskflow Skill integration (W4) are not implemented.",
+              "--list does not acquire child artifacts; collection reads explicit direct-child public references only. Nested children / arbitrary output overrides and Taskflow Skill integration (W4) are not supported.",
               "Missing Implementation records do not prove work was not performed.",
             ],
           };

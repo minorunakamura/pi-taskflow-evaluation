@@ -1,7 +1,7 @@
 # pi-taskflow-evaluation 基本設計
 
 - 作成日: 2026-10-13
-- 用途: `taskflow-planning` に渡す、新規実装の基本仕様
+- 用途: Taskflow Evaluation の基本仕様。W1 の関連付けは `docs/plans/taskflow-evaluation.md` の承認済み契約に整合する
 - 本書は基本設計であり、Approved Plan や実装開始の許可ではない。
 
 ## 1. 目的
@@ -49,7 +49,7 @@ Evaluation は独立した Pi Extension / Skill package とする。導入され
 | 単位 | 識別・意味 |
 | --- | --- |
 | Taskflow | Planning と、そこで扱う各 Issue の Implementation をまとめる単位。対応情報に Taskflow ID を持つ |
-| Issue | 実装対象。GitHub Issue は hostname / owner / repository / issue number を含めて識別する。番号だけでは識別しない |
+| Issue | 実装対象。GitHub Issue は hostname / owner / repository / issue number、local ticket は現在 cwd 内の正規化した project-relative path で識別する。番号だけでは識別しない |
 | 実行 | 一回の Planning または一つの Issue の Implementation。Root Session ID を識別子に使う |
 | 子実行 | Root に依頼された Worker / Reviewer / Scout 等。`pi-subagents` の run ID、子 Session ID、親の参照は別の識別情報として扱う |
 
@@ -77,11 +77,15 @@ Taskflow A
 
 Implementation が通常の手順で取得した Issue の参照を使い、Planning の対応情報から所属 Taskflow を解決する。ユーザーや Root Agent に Taskflow ID の記憶・別 Session への手入力を要求しない。
 
-関連付け情報は、実行中の操作ログや workflow state ではない。Plan 全文、進行中 Tool の状態、保存待ちデータ等は持たせない。通知の具体的な Tool 名・引数・記録時点は Planning で定める。Implementation の対象情報は Worker 起動前に、Planning の Issue 対応は作成・取得確認後に残せる必要がある。
+関連付け情報は、実行中の操作ログや workflow state ではない。Plan 全文、進行中 Tool の状態、保存待ちデータ等は持たせない。承認済み契約では direct Tool `taskflow_evaluation_link` の begin_planning / add_issues / implementation を用い、`pi-taskflow-evaluation.link` の version 1 payload に originSessionId / phase / operation と必要な参照を保存する。新規 begin は taskflowId 必須。Implementation の対象情報は Worker 起動前に、Planning の Issue 対応は作成・取得確認後に通知する。
 
 Skill による通知は Root Agent の Tool 呼び出しであり、機械的に保証されるものではない。呼び忘れや登録前の停止は欠損として扱う。Planning が登録した Issue に実行記録が見つからない場合も、その不足を表示し、未実施と断定しない。
 
-同じ情報の重複通知で別実行を作らない。欠けた対応、矛盾した対応、複数の所属候補は不明として表示し、会話の意味、タイトル、時刻の近さから所属を確定しない。初版では、所属補正とその履歴管理は提供しない。
+同じ情報の重複通知で別実行を作らない。Planning の Issue 追加は union。同じ Session の phase / Implementation Issue / Taskflow 切替は拒否し、fork コピーは originSessionId と header.id の不一致で所属証拠から除外する。欠けた対応、矛盾した対応、複数の所属候補は不明として表示し、会話の意味、タイトル、時刻の近さから所属を確定しない。初版では、所属補正とその履歴管理は提供しない。
+
+再計画は全 sourceIssues の明示対応が現在 cwd / 現在 Session directory の限定探索で一意かつ同じ Taskflow の場合だけ既存 ID を再利用する。不明・一件不足・複数所属・異所属・探索未完了は理由を返し、関連付け CustomEntry / pending 状態 / 回避 UUID を追加しない。正規の旧 version 1 unresolved begin は読取専用の対応未記録として識別する。その sourceIssues / add_issues を所属に昇格させず、別の明示対応を block しない。旧 Session への begin 再通知 / add_issues、再保存・ID 補完・移行は行わず、phase / conflict 判定と切替拒否を維持する。不正な旧形・未知 version は採用しない。
+
+通知前に現在の leaf が原 Session ファイルで確認できなければ、memory-only の通常 message / CustomEntry とも Evaluation の追加を停止する。append 前後の原ファイル確認で保存と partial append の冪等性を扱い、独自 queue / flush / 修復 / 自動再試行は持たない。W1 の discovery は header / 基本 entry の identity / 専用 link / origin / 安全性を検証するが、所属に不要な message role / content / Usage の非対応だけでは有効な対応を拒否しない。
 
 ### Plan とドキュメント管理
 
@@ -173,12 +177,12 @@ HTML は、一つの Taskflow の Planning / Issue / 各実行を辿れる、ロ
 
 | 項目 | 確認・判断する内容 |
 | --- | --- |
-| 関連付けの契約 | Taskflow ID の発行、`CustomEntry` の識別名・最小データ、通知 Tool と Skill の接点、重複・矛盾の扱い。既存 Issue の再計画を行う Planning の所属方法は未決。手戻りの全体を同じ Taskflow で辿れる範囲に影響するため確認する |
+| 関連付けの契約 | 承認済み Plan の3操作、明示対応が全件一意・同一 Taskflow の再計画だけの ID 再利用、非保存の関連付け不能通知、旧 unresolved の読取専用識別を適用する。Skill の optional 通知接点は W4 の範囲 |
 | ログ取得 | 対象プロジェクトの Session 列挙、対応情報の抽出、子の公開参照と親の照合、利用可能な Artifact、保持・消失、対応バージョン、会話 tree 操作の検出範囲 |
 | 集計・再集計 | 表示に必要な記録の抽出範囲、終了申告の表示、Session ID による重複防止、保存済み結果の保持、時刻・Usage の出典と不足、JSON の最小データ契約 |
 | 操作・保存 | コマンドと選択 UI、非 UI 時の指定、HTML の構成、サイズ上限・秘匿化、安全な参照・出力更新、保存権限と `.pi/` の Git 除外 |
 
-基本設計は、新規実装の入力とする。既存の部分実装を修正・互換維持する計画にはしない。コードの削除・新規実装、Taskflow の Skill への通知追加、Issue の作成・更新は、今後作る Approved Plan と別途の実行許可に従う。本書の保存だけでは実行しない。
+W1 は既存の未コミット部分実装を保持し、承認済み Plan に従って必要な箇所だけ整合させる。汎用の互換・移行基盤は作らない。W1 の負荷条件は100 Planning + 100 Implementation Sessions、Issue refs は全体で100件（各 Planning に異なる1件）で、通常・境界・異常 fixture と settings defaults は維持する。CLI の一行 receipt は既存 stdout を receiver とする公開 `Writable.prototype.write` を一回呼び、callback と error event の失敗を呼出元へ伝播する。stdout の変更・end / destroy / close、独自 retry / queue は行わない。callback 完了は読了 ACK / 永続化保証ではない。縮小負荷の成功を旧2000 Sessions / 100000 refs の約18 MB EAGAIN / ERR_SYSTEM_ERROR 切断の修正・検証・保証に置換しない。Taskflow の Skill 通知追加等は Approved Plan と個別の実行許可に従い、本書の保存だけでは実行しない。
 
 ### 期待する結果を確かめる観点
 

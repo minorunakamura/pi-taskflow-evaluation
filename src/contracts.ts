@@ -91,7 +91,8 @@ export const parameters = Type.Union([
 ]);
 export type Input = Static<typeof parameters>;
 export type Issue = Static<typeof github> | Static<typeof local>;
-const refs = Type.Array(Type.Union([github, local]), {
+export const issueSchema = Type.Union([github, local]);
+const refs = Type.Array(issueSchema, {
   minItems: 1,
   maxItems: 100,
 });

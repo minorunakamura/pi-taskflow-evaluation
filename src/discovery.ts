@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { Value } from "typebox/value";
+import { collectEntry, type Observation } from "./evidence.js";
 import {
   constants,
   closeSync,
@@ -14,6 +16,7 @@ import {
   contained,
   customType,
   issueKey,
+  linkSchema,
   unionIssues,
   validLink,
   type Issue,
@@ -35,11 +38,16 @@ export interface Run {
   links: Link[];
   warnings: string[];
   entryIds: Set<string>;
+  observations: Observation[];
+  lastEntryId: string | null;
+  sourceBytes: number;
 }
 export interface Scan {
   runs: Run[];
   warnings: Warning[];
   complete: boolean;
+  savedTaskflows?: { taskflowId: string; displayName: string }[];
+  quarantines?: { sessionId: string; reasons: string[] }[];
 }
 export interface ReadBudget {
   bytes: number;
@@ -86,13 +94,19 @@ export function readRun(
   cwd: string,
   limits: Limits,
   budget: ReadBudget,
-): { run?: Run; warnings: Warning[]; complete: boolean } {
+): {
+  run?: Run;
+  warnings: Warning[];
+  complete: boolean;
+  quarantines?: { sessionId: string; reasons: string[] }[];
+} {
   const warnings: Warning[] = [];
   const fail = (code: string, key?: keyof Limits) => {
     warnings.push(warning(code, file, key, limits));
   };
   let fd: number | undefined;
   let run: Run | undefined;
+  const quarantines: { sessionId: string; reasons: string[] }[] = [];
   try {
     if (lstatSync(sessionDir).isSymbolicLink())
       throw new Error("unsafe_session_directory");
@@ -165,6 +179,9 @@ export function readRun(
           file,
           timestamp: entry.timestamp,
           links: [],
+          observations: [],
+          lastEntryId: null,
+          sourceBytes: start.size,
           entryIds: ids,
           warnings:
             entry.parentSession === undefined ? [] : ["derived_session"],
@@ -185,11 +202,18 @@ export function readRun(
       if (
         ids.has(entry.id) ||
         (entry.parentId !== null && !ids.has(entry.parentId))
-      )
+      ) {
+        if (run)
+          quarantines.push({
+            sessionId: run.sessionId,
+            reasons: ["invalid_entry_chain"],
+          });
         throw new Error("invalid_entry_chain");
+      }
       if (entry.parentId !== previous || entry.type === "branch_summary")
         run?.warnings.push("recorded_tree_navigation");
       previous = entry.id;
+      if (run) run.lastEntryId = entry.id;
       ids.add(entry.id);
       if (entry.type === "custom" && entry.customType === customType) {
         if (line.length > 65536 || !validLink(entry.data, cwd))
@@ -198,6 +222,15 @@ export function readRun(
           run.links.push(entry.data);
         else run?.warnings.push("fork_copy_ignored");
       }
+      if (run)
+        collectEntry(
+          entry,
+          run.sessionId,
+          file,
+          limits,
+          run.observations,
+          run.warnings,
+        );
     };
     while (offset < start.size) {
       const size = readSync(
@@ -231,6 +264,8 @@ export function readRun(
     if (
       !current.isFile() ||
       current.isSymbolicLink() ||
+      realpathSync(dirname(path)) !== root ||
+      !contained(root, realpathSync(path)) ||
       end.ino !== current.ino ||
       end.dev !== current.dev ||
       end.size < start.size ||
@@ -280,7 +315,7 @@ export function readRun(
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
-  return { run, warnings, complete: warnings.length === 0 };
+  return { run, warnings, complete: warnings.length === 0, quarantines };
 }
 
 export function discover(
@@ -289,7 +324,12 @@ export function discover(
   limits: Limits,
   budget: ReadBudget,
 ): Scan {
-  const scan: Scan = { runs: [], warnings: [], complete: true };
+  const scan: Scan = {
+    runs: [],
+    warnings: [],
+    complete: true,
+    quarantines: [],
+  };
   try {
     if (
       lstatSync(sessionDir).isSymbolicLink() ||
@@ -319,6 +359,7 @@ export function discover(
           budget,
         );
         scan.warnings.push(...result.warnings);
+        scan.quarantines!.push(...(result.quarantines ?? []));
         if (result.run) scan.runs.push(result.run);
       }
     } finally {
@@ -329,17 +370,35 @@ export function discover(
   }
   const ids = new Set<string>();
   for (const run of scan.runs) {
-    if (ids.has(run.sessionId))
+    if (ids.has(run.sessionId)) {
       scan.warnings.push(warning("duplicate_session_id", basename(run.file)));
+      scan.quarantines!.push({
+        sessionId: run.sessionId,
+        reasons: ["duplicate_session_id"],
+      });
+    }
     ids.add(run.sessionId);
-    if (runConflict(run.links))
+    if (runConflict(run.links, run.observations))
       scan.warnings.push(warning("registration_conflict", run.file));
   }
   scan.complete = scan.warnings.length === 0;
   return scan;
 }
 
-export function runConflict(links: Link[]): boolean {
+export function runConflict(
+  links: Link[],
+  observations: Observation[] = [],
+): boolean {
+  const proofs = new Map<string, string>();
+  for (const observation of observations)
+    if (observation.kind === "link") {
+      if (
+        proofs.has(observation.key) &&
+        proofs.get(observation.key) !== observation.sourceDigest
+      )
+        return true;
+      proofs.set(observation.key, observation.sourceDigest);
+    }
   if (new Set(links.map((link) => link.phase)).size > 1) return true;
   const beginnings = links.filter(
     (link) => link.operation === "begin_planning",
@@ -359,17 +418,47 @@ export function runConflict(links: Link[]): boolean {
     ).size > 1
   );
 }
-function membershipIndex(scan: Scan) {
+export function membershipIndex(scan: Scan) {
   const issueTaskflows = new Map<
     string,
-    { issue: Issue; taskflowIds: Set<string> }
+    { issue: Issue; taskflowIds: Set<string>; conflicted: boolean }
   >();
   for (const run of scan.runs) {
-    if (runConflict(run.links)) continue;
-    const begin = run.links.find((link) => link.operation === "begin_planning");
-    if (begin?.operation !== "begin_planning" || !begin.taskflowId) continue;
+    const beginnings = run.links.filter(
+      (link) => link.operation === "begin_planning",
+    );
+    const taskflowIds = new Set(
+      beginnings.flatMap((link) => (link.taskflowId ? [link.taskflowId] : [])),
+    );
+    if (!taskflowIds.size) continue;
+    const beginningConflict =
+      new Set(run.links.map((link) => link.phase)).size > 1 ||
+      new Set(beginnings.map((link) => JSON.stringify(link))).size > 1;
+    const proofs = new Map<string, { digests: Set<string>; issues: Issue[] }>();
+    for (const observation of run.observations) {
+      if (
+        observation.kind !== "link" ||
+        !Value.Check(linkSchema, observation.value)
+      )
+        continue;
+      const proof = proofs.get(observation.key) ?? {
+        digests: new Set<string>(),
+        issues: [],
+      };
+      proof.digests.add(observation.sourceDigest);
+      if (observation.value.operation === "add_issues")
+        proof.issues.push(...observation.value.issues);
+      proofs.set(observation.key, proof);
+    }
+    const conflictingRefs = new Set(
+      [...proofs.values()]
+        .filter((proof) => proof.digests.size > 1)
+        .flatMap((proof) => proof.issues.map(issueKey)),
+    );
     const refs = [
-      ...(begin.sourceIssues ?? []),
+      ...beginnings.flatMap((begin) =>
+        begin.taskflowId ? (begin.sourceIssues ?? []) : [],
+      ),
       ...run.links.flatMap((link) =>
         link.operation === "add_issues" ? link.issues : [],
       ),
@@ -379,16 +468,19 @@ function membershipIndex(scan: Scan) {
       const mapping = issueTaskflows.get(key) ?? {
         issue,
         taskflowIds: new Set<string>(),
+        conflicted: false,
       };
-      mapping.taskflowIds.add(begin.taskflowId);
+      for (const taskflowId of taskflowIds) mapping.taskflowIds.add(taskflowId);
+      mapping.conflicted ||= beginningConflict || conflictingRefs.has(key);
       issueTaskflows.set(key, mapping);
     }
   }
   const resolveKnown = (keys: string[]) => {
     let taskflowId: string | undefined;
     for (const key of keys) {
-      const ids = issueTaskflows.get(key)?.taskflowIds;
-      if (!ids || ids.size !== 1) return undefined;
+      const mapping = issueTaskflows.get(key);
+      const ids = mapping?.taskflowIds;
+      if (!ids || ids.size !== 1 || mapping?.conflicted) return undefined;
       const id = ids.values().next().value!;
       if (taskflowId && id !== taskflowId) return undefined;
       taskflowId = id;
@@ -407,8 +499,7 @@ function membershipIndex(scan: Scan) {
 export function ownership(scan: Scan, issues: Issue[]): string | undefined {
   return membershipIndex(scan).resolve(issues);
 }
-export function candidateList(scan: Scan) {
-  const membership = membershipIndex(scan);
+export function candidateList(scan: Scan, membership = membershipIndex(scan)) {
   const candidates = new Map<
     string,
     {
@@ -423,7 +514,7 @@ export function candidateList(scan: Scan) {
   >();
   const unresolved: { sessionId: string; reason: string }[] = [];
   for (const run of scan.runs) {
-    if (runConflict(run.links)) {
+    if (runConflict(run.links, run.observations)) {
       unresolved.push({
         sessionId: run.sessionId,
         reason: "registration_conflict",
@@ -464,9 +555,19 @@ export function candidateList(scan: Scan) {
         reason: "registration_not_found",
       });
   }
+  for (const saved of scan.savedTaskflows ?? [])
+    if (!candidates.has(saved.taskflowId))
+      candidates.set(saved.taskflowId, {
+        ...saved,
+        planningSessionIds: [],
+        planningTimestamps: [],
+        implementationSessionIds: [],
+        issues: [],
+        missingImplementationIssues: [],
+      });
   const implementedIssues = new Set<string>();
   for (const run of scan.runs) {
-    if (runConflict(run.links)) continue;
+    if (runConflict(run.links, run.observations)) continue;
     const implementation = run.links.find(
       (link) => link.operation === "implementation",
     );

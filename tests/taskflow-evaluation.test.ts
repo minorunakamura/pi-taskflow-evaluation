@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs, {
   appendFileSync,
   closeSync,
@@ -1357,9 +1357,9 @@ test("public Pi loader, registered tool and SDK command prompt work with effecti
       session.extensionRunner.createToolContext("probe", undefined),
     );
     expect(result.details).toMatchObject({ status: "saved" });
-    const list = async () => {
+    const list = async (args = "--list") => {
       lines.length = 0;
-      await session.prompt("/taskflow-evaluate --list");
+      await session.prompt(`/taskflow-evaluate ${args}`);
       const line = lines.find((value) =>
         value.startsWith("TASKFLOW_EVALUATION_RESULT "),
       )!;
@@ -1393,6 +1393,19 @@ test("public Pi loader, registered tool and SDK command prompt work with effecti
       maxSessionFiles: 7,
       maxReportJsonMiB: 64,
     });
+    const sourceBefore = readFileSync(manager.getSessionFile()!);
+    const collected = await list(
+      `--taskflow ${resultTaskflowId(result.details)}`,
+    );
+    expect(collected).toMatchObject({
+      status: "updated",
+      jsonCommitted: true,
+      htmlUpdated: true,
+    });
+    expect(
+      JSON.parse(readFileSync(collected.files.json, "utf8")).contentDigest,
+    ).toBe(collected.contentDigest);
+    expect(readFileSync(manager.getSessionFile()!)).toEqual(sourceBefore);
     expect(modelGuards.every((guard) => guard.mock.calls.length === 0)).toBe(
       true,
     );
@@ -1940,4 +1953,1493 @@ test("taskflow-evaluate refuses shortened files and conflicting origin registrat
     reason: "registration_conflict",
   });
   expect(readFileSync(conflicting.getSessionFile()!)).toEqual(before);
+});
+
+test("taskflow-evaluate collects Root reports and explicit bash observations without changing logs", async () => {
+  const { cwd, sessionDir } = workspace();
+  const planning = SessionManager.create(cwd, sessionDir);
+  planning.appendMessage({
+    role: "user",
+    content: "Plan <script>alert(1)</script>",
+    timestamp: Date.now(),
+  });
+  const app = runtime(planning);
+  const id = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Delivery" }),
+  );
+  await app.link({
+    operation: "add_issues",
+    issues: ["https://github.com/example/project/issues/2"],
+  });
+  const implementation = SessionManager.create(cwd, sessionDir);
+  implementation.appendMessage({
+    role: "user",
+    content: "Implement",
+    timestamp: Date.now(),
+  });
+  await runtime(implementation).link({
+    operation: "implementation",
+    issue: "https://github.com/example/project/issues/2",
+  });
+  implementation.appendMessage({
+    role: "bashExecution",
+    command: "pnpm test",
+    output: "passed",
+    exitCode: 0,
+    cancelled: false,
+    truncated: false,
+    timestamp: Date.now(),
+  });
+  const before = readFileSync(implementation.getSessionFile()!);
+  const receipt = await app.list("https://github.com/example/project/issues/2");
+  expect(receipt).toMatchObject({
+    status: "updated",
+    taskflowId: id,
+    jsonCommitted: true,
+    htmlUpdated: true,
+  });
+  const report = JSON.parse(readFileSync(receipt.files.json, "utf8"));
+  expect(report).toMatchObject({
+    schemaVersion: 1,
+    taskflowId: id,
+    contentDigest: receipt.contentDigest,
+  });
+  expect(
+    report.roots
+      .map((root: { sessionId: string }) => root.sessionId)
+      .toSorted(),
+  ).toEqual(
+    [planning.getSessionId(), implementation.getSessionId()].toSorted(),
+  );
+  expect(report.observations).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        kind: "exit",
+        value: 0,
+        provenance: expect.objectContaining({
+          sessionId: implementation.getSessionId(),
+          field: "message.exitCode",
+        }),
+      }),
+    ]),
+  );
+  const html = readFileSync(receipt.files.html, "utf8");
+  expect(html).toContain(receipt.contentDigest);
+  expect(html).toContain("&lt;script&gt;");
+  expect(html).not.toContain("<script>");
+  expect(fs.statSync(receipt.files.json).mode & 0o777).toBe(0o600);
+  expect(
+    fs.statSync(join(cwd, ".pi", "taskflow-reports", id)).mode & 0o777,
+  ).toBe(0o700);
+  expect(readFileSync(implementation.getSessionFile()!)).toEqual(before);
+});
+
+test("taskflow-evaluate preserves immutable evidence and saved explicit ownership after source loss", async () => {
+  const { cwd, sessionDir } = workspace();
+  const planning = SessionManager.create(cwd, sessionDir);
+  planning.appendMessage({
+    role: "user",
+    content: "Original request",
+    timestamp: Date.now(),
+  });
+  const app = runtime(planning);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Saved delivery",
+    }),
+  );
+  await app.link({
+    operation: "add_issues",
+    issues: ["https://github.com/example/project/issues/3"],
+  });
+  const first = await app.list(`--taskflow ${id}`);
+  expect(first.jsonCommitted).toBe(true);
+  const original = JSON.parse(readFileSync(first.files.json, "utf8"));
+  const firstEntry = planning.getEntries()[0];
+  const source = readFileSync(planning.getSessionFile()!, "utf8");
+  writeFileSync(
+    planning.getSessionFile()!,
+    source.replace("Original request", "Changed request"),
+  );
+  const changed = await app.list(`--taskflow ${id}`);
+  expect(changed.jsonCommitted).toBe(true);
+  const merged = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(merged.conflicts).toEqual(
+    expect.arrayContaining([expect.stringContaining(firstEntry.id)]),
+  );
+  expect(
+    merged.observations
+      .filter((o: { kind: string }) => o.kind === "request")
+      .map((o: { value: string }) => o.value),
+  ).toEqual(["Original request", "Changed request"]);
+  rmSync(planning.getSessionFile()!);
+  const replan = SessionManager.create(cwd, sessionDir);
+  replan.appendMessage({
+    role: "user",
+    content: "Replan",
+    timestamp: Date.now(),
+  });
+  const reuse = await runtime(replan).link({
+    operation: "begin_planning",
+    displayName: "Replan",
+    sourceIssues: ["https://github.com/example/project/issues/3"],
+  });
+  expect(reuse).toMatchObject({ status: "saved", taskflowId: id });
+  const lost = await runtime(replan).list(
+    "https://github.com/example/project/issues/3",
+  );
+  expect(lost).toMatchObject({ jsonCommitted: true, htmlUpdated: true });
+  const preserved = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(
+    preserved.roots.find(
+      (root: { sessionId: string }) =>
+        root.sessionId === planning.getSessionId(),
+    ),
+  ).toMatchObject({ availability: "missing_or_unread" });
+  expect(preserved.observations.length).toBeGreaterThan(
+    original.observations.length,
+  );
+});
+
+test("taskflow-evaluate quarantines saved evidence on later tree detection and keeps it after shortening", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = SessionManager.create(cwd, sessionDir);
+  manager.appendMessage({
+    role: "user",
+    content: "First branch",
+    timestamp: Date.now(),
+  });
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Branches" }),
+  );
+  const first = await app.list(`--taskflow ${id}`);
+  expect(first.jsonCommitted).toBe(true);
+  const file = manager.getSessionFile()!;
+  const initial = readFileSync(file, "utf8");
+  const entries = manager.getEntries();
+  appendFileSync(
+    file,
+    `${JSON.stringify({ type: "branch_summary", id: "branch-later", parentId: entries[0].id, timestamp: new Date().toISOString(), fromId: entries.at(-1)!.id, summary: "Another branch" })}\n`,
+  );
+  const detected = await app.list(`--taskflow ${id}`);
+  expect(detected.jsonCommitted).toBe(true);
+  let report = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(report.roots[0].quarantine).toContain("recorded_tree_navigation");
+  writeFileSync(file, initial);
+  expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+  report = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(report.roots[0]).toMatchObject({
+    availability: "shortened",
+    latestReportKey: null,
+  });
+  expect(report.roots[0].quarantine).toContain("recorded_tree_navigation");
+  expect(report.observations).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ kind: "summary", value: "Another branch" }),
+    ]),
+  );
+});
+
+test("taskflow-evaluate redacts known secrets and excludes replay payloads from Root evidence", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = SessionManager.create(cwd, sessionDir);
+  manager.appendMessage({
+    role: "user",
+    content:
+      'Authorization: Bearer sensitive-value password="secret with spaces" https://user:credential@example.com ghp_abcdefghijklmnop1234567890',
+    timestamp: Date.now(),
+  });
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Redaction" }),
+  );
+  const entries = manager.getEntries();
+  appendFileSync(
+    manager.getSessionFile()!,
+    `${JSON.stringify({
+      type: "message",
+      id: "assistant-safe",
+      parentId: entries.at(-1)!.id,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        timestamp: Date.now(),
+        content: [
+          {
+            type: "thinking",
+            thinking: "PRIVATE THINKING",
+            thinkingSignature: "SIGNATURE",
+          },
+          { type: "text", text: "Reported READY_FOR_MERGE" },
+          {
+            type: "toolCall",
+            id: "child",
+            name: "subagent",
+            arguments: {
+              token: "STRUCTURED SECRET",
+              password: "PASSWORD",
+              content: [{ type: "image", data: "BASE64 IMAGE" }],
+            },
+          },
+        ],
+      },
+    })}\n`,
+  );
+  const receipt = await app.list(`--taskflow ${id}`);
+  expect(receipt.jsonCommitted).toBe(true);
+  const json = readFileSync(receipt.files.json, "utf8");
+  for (const secret of [
+    "sensitive-value",
+    "secret with spaces",
+    "credential",
+    "ghp_abcdefghijklmnop1234567890",
+    "PRIVATE THINKING",
+    "SIGNATURE",
+    "STRUCTURED SECRET",
+    "PASSWORD",
+    "BASE64 IMAGE",
+  ])
+    expect(json).not.toContain(secret);
+  expect(json).toContain("[REDACTED]");
+  expect(receipt.warnings).toContain("known_secret_redaction_applied");
+});
+
+test.each(["tui", "rpc"] as const)(
+  "taskflow-evaluate %s selection and cancellation use public dialog boundaries without conversation additions",
+  async (mode) => {
+    const { cwd, sessionDir } = workspace();
+    const manager = savedSession(cwd, sessionDir);
+    const id = resultTaskflowId(
+      await runtime(manager).link({
+        operation: "begin_planning",
+        displayName: "UI delivery",
+      }),
+    );
+    const runner = await registeredRuntime(manager);
+    const notices: string[] = [];
+    let choose = false;
+    runner.setUIContext(
+      {
+        ...runner.getUIContext(),
+        select: async (_title, choices) =>
+          choose
+            ? choices.find((choice) => choice.includes("UI delivery"))
+            : undefined,
+        notify: (text) => {
+          notices.push(text);
+        },
+      },
+      mode,
+    );
+    const context = runner.createCommandContext();
+    context.waitForIdle = async () => {};
+    const before = readFileSync(manager.getSessionFile()!);
+    await runner.getCommand("taskflow-evaluate")!.handler("", context);
+    expect(notices.at(-1)).toContain('"status":"cancelled"');
+    expect(fs.existsSync(join(cwd, ".pi", "taskflow-reports", id))).toBe(false);
+    choose = true;
+    await runner.getCommand("taskflow-evaluate")!.handler("", context);
+    expect(notices.at(-1)).toContain('"jsonCommitted":true');
+    expect(readFileSync(manager.getSessionFile()!)).toEqual(before);
+  },
+);
+
+test("taskflow-evaluate keeps the old pair on schema, lock, permission and symlink failures", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Safety" }),
+  );
+  const first = await app.list(`--taskflow ${id}`);
+  expect(first.jsonCommitted).toBe(true);
+  const json = readFileSync(first.files.json);
+  const page = readFileSync(first.files.html);
+  const lock = join(cwd, ".pi", "taskflow-reports", id, "report.lock");
+  writeFileSync(lock, "foreign lock", { mode: 0o600 });
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "report_busy",
+    jsonCommitted: false,
+  });
+  expect(readFileSync(lock, "utf8")).toBe("foreign lock");
+  rmSync(lock);
+  fs.chmodSync(first.files.json, 0o644);
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "report_permissions",
+    jsonCommitted: false,
+  });
+  fs.chmodSync(first.files.json, 0o600);
+  writeFileSync(first.files.json, '{"schemaVersion":99}');
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "invalid_report_schema",
+    jsonCommitted: false,
+  });
+  expect(readFileSync(first.files.json, "utf8")).toBe('{"schemaVersion":99}');
+  writeFileSync(first.files.json, json);
+  rmSync(first.files.html);
+  const external = join(cwd, "outside.html");
+  writeFileSync(external, "outside");
+  symlinkSync(external, first.files.html);
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "unsafe_report_path",
+    jsonCommitted: false,
+  });
+  expect(readFileSync(first.files.json)).toEqual(json);
+  expect(readFileSync(external, "utf8")).toBe("outside");
+  rmSync(first.files.html);
+  writeFileSync(first.files.html, page, { mode: 0o600 });
+});
+
+test.each(["temp", "json", "html"] as const)(
+  "taskflow-evaluate %s filesystem failure preserves commit boundaries and supports next-run HTML repair",
+  async (phase) => {
+    const { cwd, sessionDir } = workspace();
+    const manager = savedSession(cwd, sessionDir);
+    const app = runtime(manager);
+    const id = resultTaskflowId(
+      await app.link({
+        operation: "begin_planning",
+        displayName: "Commit boundary",
+      }),
+    );
+    const first = await app.list(`--taskflow ${id}`);
+    const oldJson = readFileSync(first.files.json);
+    const oldHtml = readFileSync(first.files.html);
+    manager.appendMessage({
+      role: "user",
+      content: "New observation",
+      timestamp: Date.now(),
+    });
+    const originalOpen = fs.openSync;
+    const originalRename = fs.renameSync;
+    const open = vi.spyOn(fs, "openSync").mockImplementation((...args) => {
+      if (phase === "temp" && String(args[0]).endsWith(".html.tmp"))
+        throw new Error("temp failure");
+      if (
+        phase === "temp" &&
+        String(args[0]).includes("report.html.") &&
+        String(args[0]).endsWith(".tmp")
+      )
+        throw new Error("temp failure");
+      return originalOpen(...args);
+    });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (
+        phase !== "temp" &&
+        String(to).endsWith(`report.${phase === "json" ? "json" : "html"}`)
+      )
+        throw new Error("rename failure");
+      originalRename(from, to);
+    });
+    syncBuiltinESMExports();
+    let receipt;
+    try {
+      receipt = await app.list(`--taskflow ${id}`);
+    } finally {
+      open.mockRestore();
+      rename.mockRestore();
+      syncBuiltinESMExports();
+    }
+    expect(receipt).toMatchObject({
+      jsonCommitted: phase === "html",
+      htmlUpdated: false,
+    });
+    expect(readFileSync(first.files.html)).toEqual(oldHtml);
+    if (phase !== "html")
+      expect(readFileSync(first.files.json)).toEqual(oldJson);
+    else {
+      expect(receipt).toMatchObject({
+        status: "partial_success",
+        errorCode: "html_update_failed",
+      });
+      expect(readFileSync(first.files.json)).not.toEqual(oldJson);
+    }
+    const repaired = await app.list(`--taskflow ${id}`);
+    expect(repaired).toMatchObject({ jsonCommitted: true, htmlUpdated: true });
+    if (phase === "html")
+      expect(repaired.warnings).toContain(
+        "html_digest_mismatch; regenerated from canonical JSON",
+      );
+    expect(readFileSync(first.files.html, "utf8")).toContain(
+      repaired.contentDigest,
+    );
+    expect(
+      readdirSync(join(cwd, ".pi", "taskflow-reports", id)).toSorted(),
+    ).toEqual(["report.html", "report.json"]);
+  },
+);
+
+test("taskflow-evaluate merge limits and dedicated saved JSON limit stop without discarding the old pair", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  let limits: Record<string, number> = {};
+  const app = runtime(manager, {
+    settings: () => ({ "taskflow-evaluation": { limits } }),
+  });
+  const id = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Limits" }),
+  );
+  const initial = await app.list(`--taskflow ${id}`);
+  const before = readFileSync(initial.files.json);
+  const beforeHtml = readFileSync(initial.files.html);
+  limits = { maxRecords: 1 };
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "report_merge_limit",
+    key: "maxRecords",
+    value: 1,
+    jsonCommitted: false,
+  });
+  expect(readFileSync(initial.files.json)).toEqual(before);
+  expect(readFileSync(initial.files.html)).toEqual(beforeHtml);
+  limits = { maxReportJsonMiB: 4 };
+  for (let i = 0; i < 100; i++)
+    manager.appendMessage({
+      role: "user",
+      content: `${i} ${"a".repeat(16300)}`,
+      timestamp: Date.now(),
+    });
+  expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+  const largeJson = readFileSync(initial.files.json);
+  expect(largeJson.length).toBeGreaterThan(1048576);
+  rmSync(manager.getSessionFile()!);
+  limits = { maxFileMiB: 1, maxReportJsonMiB: 1 };
+  const lower = await app.list(`--taskflow ${id}`);
+  expect(lower).toMatchObject({
+    errorCode: "report_read_limit",
+    jsonCommitted: false,
+  });
+  expect(lower.warnings).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ key: "maxReportJsonMiB", value: 1 }),
+    ]),
+  );
+  expect(readFileSync(initial.files.json)).toEqual(largeJson);
+  limits = { maxFileMiB: 1, maxReportJsonMiB: 4 };
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    jsonCommitted: true,
+    htmlUpdated: true,
+  });
+});
+
+test("taskflow-evaluate requires all output paths Git ignored and refuses tracked reports without changing Git state", async () => {
+  const { cwd, sessionDir } = workspace();
+  expect(spawnSync("git", ["init", cwd]).status).toBe(0);
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Git safety" }),
+  );
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "report_git_not_private",
+    jsonCommitted: false,
+  });
+  writeFileSync(join(cwd, ".gitignore"), ".pi/taskflow-reports/\n");
+  const first = await app.list(`--taskflow ${id}`);
+  expect(first.jsonCommitted).toBe(true);
+  expect(
+    spawnSync("git", ["-C", cwd, "add", "-f", first.files.json]).status,
+  ).toBe(0);
+  const index = readFileSync(join(cwd, ".git", "index"));
+  const ignored = readFileSync(join(cwd, ".gitignore"));
+  expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+    errorCode: "report_git_not_private",
+    jsonCommitted: false,
+  });
+  expect(readFileSync(join(cwd, ".git", "index"))).toEqual(index);
+  expect(readFileSync(join(cwd, ".gitignore"))).toEqual(ignored);
+});
+
+test("taskflow-evaluate retains conflicting saved link values without guessing new ownership", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Immutable link",
+    }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  const first = await app.list(`--taskflow ${id}`);
+  expect(first.jsonCommitted).toBe(true);
+  const file = manager.getSessionFile()!;
+  writeFileSync(
+    file,
+    readFileSync(file, "utf8").replace(
+      '"displayName":"Immutable link"',
+      '"displayName":"Altered immutable link"',
+    ),
+  );
+  const conflicting = await app.list(`--taskflow ${id}`);
+  expect(conflicting).toMatchObject({ jsonCommitted: true, htmlUpdated: true });
+  const report = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(report.conflicts).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining("immutable_source_conflict"),
+    ]),
+  );
+  expect(report.roots[0].quarantine).toContain("registration_conflict");
+  const replan = savedSession(cwd, sessionDir);
+  expect(
+    await runtime(replan).link({
+      operation: "begin_planning",
+      displayName: "Do not guess",
+      sourceIssues: [issue1],
+    }),
+  ).toMatchObject({
+    status: "rejected",
+    errorCode: "planning_source_issues_unresolved",
+  });
+});
+
+test.each(["text", "json"])(
+  "public Pi CLI %s collects Root JSON/HTML with complete receipt and unchanged sources",
+  async (mode) => {
+    const cwd = realpathSync(workspace().cwd);
+    const sessionDir = join(cwd, "sessions");
+    const agentDir = join(cwd, "agent");
+    mkdirSync(agentDir);
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ cacheWarming: "off", retry: { enabled: false } }),
+    );
+    const manager = savedSession(cwd, sessionDir);
+    const id = resultTaskflowId(
+      await runtime(manager).link({
+        operation: "begin_planning",
+        displayName: "CLI reporting",
+      }),
+    );
+    const source = readFileSync(manager.getSessionFile()!);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_OFFLINE: "1",
+    };
+    for (const key of Object.keys(env))
+      if (
+        key.endsWith("_API_KEY") ||
+        /^(ANTHROPIC|OPENAI|GOOGLE|AZURE|GEMINI|COPILOT|GITHUB)_/.test(key)
+      )
+        delete env[key];
+    const result = spawnSync(
+      process.execPath,
+      [
+        resolve(
+          "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+        ),
+        "--offline",
+        "--no-extensions",
+        "-e",
+        resolve("src/index.ts"),
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--no-mcp",
+        "--session-dir",
+        sessionDir,
+        "--print",
+        "--mode",
+        mode,
+        `/taskflow-evaluate --taskflow ${id}`,
+      ],
+      { cwd, env, encoding: "utf8", timeout: 30000, maxBuffer: 1048576 },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.endsWith("\n")).toBe(true);
+    expect(result.stderr).not.toMatch(
+      /TASKFLOW_EVALUATION_RESULT|command error|Error in command|EPIPE/i,
+    );
+    const lines = result.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("TASKFLOW_EVALUATION_RESULT "));
+    expect(lines).toHaveLength(1);
+    const receipt = JSON.parse(
+      lines[0].slice("TASKFLOW_EVALUATION_RESULT ".length),
+    );
+    expect(receipt).toMatchObject({
+      status: "updated",
+      taskflowId: id,
+      jsonCommitted: true,
+      htmlUpdated: true,
+    });
+    expect(
+      JSON.parse(readFileSync(receipt.files.json, "utf8")).contentDigest,
+    ).toBe(receipt.contentDigest);
+    expect(readFileSync(receipt.files.html, "utf8")).toContain(
+      receipt.contentDigest,
+    );
+    expect(readFileSync(manager.getSessionFile()!)).toEqual(source);
+    expect(result.stdout).not.toContain('"type":"message_start"');
+  },
+);
+
+test.each([
+  "derived",
+  "multiple_roots",
+  "parent_jump",
+  "leaf",
+  "duplicate",
+  "missing_parent",
+] as const)(
+  "taskflow-evaluate reports %s navigation without adopting invalid identity",
+  async (kind) => {
+    const { cwd, sessionDir } = workspace();
+    const manager = savedSession(cwd, sessionDir);
+    const app = runtime(manager);
+    const id = resultTaskflowId(
+      await app.link({
+        operation: "begin_planning",
+        displayName: "Tree boundary",
+      }),
+    );
+    const first = await app.list(`--taskflow ${id}`);
+    const oldJson = readFileSync(first.files.json);
+    const oldHtml = readFileSync(first.files.html);
+    const file = manager.getSessionFile()!;
+    const entries = manager.getEntries();
+    if (kind === "derived") {
+      const lines = readFileSync(file, "utf8").split("\n");
+      const header = JSON.parse(lines[0]);
+      header.parentSession = join(sessionDir, "parent.jsonl");
+      lines[0] = JSON.stringify(header);
+      writeFileSync(file, lines.join("\n"));
+    } else if (kind === "leaf") manager.branch(entries[0].id);
+    else
+      appendFileSync(
+        file,
+        `${JSON.stringify({ type: "message", id: kind === "duplicate" ? entries[0].id : `extra-${kind}`, parentId: kind === "multiple_roots" ? null : kind === "missing_parent" ? "nonexistent" : entries[0].id, timestamp: new Date().toISOString(), message: { role: "user", timestamp: Date.now(), content: "New branch" } })}\n`,
+      );
+    const receipt = await app.list(`--taskflow ${id}`);
+    if (kind === "duplicate" || kind === "missing_parent") {
+      expect(receipt).toMatchObject({
+        errorCode: "discovery_incomplete",
+        jsonCommitted: false,
+        htmlUpdated: false,
+      });
+      expect(receipt.detectedQuarantine).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sessionId: manager.getSessionId(),
+            reasons: ["invalid_entry_chain"],
+          }),
+        ]),
+      );
+      expect(readFileSync(first.files.json)).toEqual(oldJson);
+      expect(readFileSync(first.files.html)).toEqual(oldHtml);
+    } else {
+      expect(receipt.jsonCommitted).toBe(true);
+      const report = JSON.parse(readFileSync(first.files.json, "utf8"));
+      expect(report.roots[0].quarantine).toContain(
+        kind === "derived"
+          ? "derived_session"
+          : kind === "leaf"
+            ? "current_leaf_mismatch"
+            : "recorded_tree_navigation",
+      );
+    }
+  },
+);
+
+test.each(["maxReportJsonMiB", "maxReportHtmlMiB"] as const)(
+  "taskflow-evaluate %s output overflow leaves both old files untouched",
+  async (key) => {
+    const { cwd, sessionDir } = workspace();
+    const manager = savedSession(cwd, sessionDir);
+    let limits: Record<string, number> = {};
+    const app = runtime(manager, {
+      settings: () => ({ "taskflow-evaluation": { limits } }),
+    });
+    const id = resultTaskflowId(
+      await app.link({
+        operation: "begin_planning",
+        displayName: "Output overflow",
+      }),
+    );
+    const first = await app.list(`--taskflow ${id}`);
+    const json = readFileSync(first.files.json),
+      page = readFileSync(first.files.html);
+    for (let i = 0; i < 100; i++)
+      manager.appendMessage({
+        role: "user",
+        content: "x".repeat(16300),
+        timestamp: Date.now(),
+      });
+    limits = { [key]: 1 };
+    const failed = await app.list(`--taskflow ${id}`);
+    expect(failed).toMatchObject({
+      errorCode: "report_merge_limit",
+      key,
+      value: 1,
+      jsonCommitted: false,
+      htmlUpdated: false,
+    });
+    expect(failed.resume).toContain(`/reload`);
+    expect(failed.unreflected).toContain("not committed");
+    expect(readFileSync(first.files.json)).toEqual(json);
+    expect(readFileSync(first.files.html)).toEqual(page);
+  },
+);
+
+test.each([
+  "tool_value",
+  "report_field",
+  "link_origin",
+  "legacy_link",
+  "source_file",
+  "usage",
+] as const)(
+  "taskflow-evaluate validates saved %s evidence before using membership",
+  async (kind) => {
+    const { cwd, sessionDir } = workspace();
+    const manager = savedSession(cwd, sessionDir);
+    const app = runtime(manager);
+    const id = resultTaskflowId(
+      await app.link({
+        operation: "begin_planning",
+        displayName: "Saved schema",
+      }),
+    );
+    await app.link({ operation: "add_issues", issues: [issue1] });
+    const first = await app.list(`--taskflow ${id}`);
+    const report = JSON.parse(readFileSync(first.files.json, "utf8"));
+    const observation = report.observations.find(
+      (o: { kind: string }) =>
+        o.kind ===
+        (kind === "link_origin" || kind === "legacy_link" ? "link" : "request"),
+    );
+    if (kind === "tool_value") {
+      observation.kind = "tool_call";
+      observation.value = true;
+      observation.provenance.field = "message.content.0";
+    }
+    if (kind === "report_field") {
+      observation.kind = "report";
+      observation.value = "Spoofed report";
+      observation.provenance.field = "message.details.password";
+    }
+    if (kind === "link_origin")
+      observation.value.originSessionId = "other-session";
+    if (kind === "legacy_link") {
+      delete observation.value.taskflowId;
+      observation.value.unresolved = "source_issues_unresolved";
+      observation.value.sourceIssues = [
+        {
+          kind: "github",
+          host: "github.com",
+          owner: "example",
+          repo: "project",
+          number: 1,
+        },
+      ];
+    }
+    if (kind === "source_file")
+      observation.provenance.file = join(cwd, "outside.jsonl");
+    if (kind === "usage") {
+      observation.kind = "usage";
+      observation.value = { input: -1 };
+      observation.provenance.field = "message.usage.root_assistant";
+    }
+    observation.key = JSON.stringify([
+      "session",
+      observation.provenance.sessionId,
+      observation.provenance.entryId,
+      observation.provenance.field,
+    ]);
+    observation.sourceDigest = createHash("sha256")
+      .update(JSON.stringify(observation.value))
+      .digest("hex");
+    const { contentDigest: _digest, ...data } = report;
+    report.contentDigest = createHash("sha256")
+      .update(JSON.stringify(data))
+      .digest("hex");
+    const corrupted = JSON.stringify(report);
+    writeFileSync(first.files.json, corrupted);
+    expect(await app.list(`--taskflow ${id}`)).toMatchObject({
+      status: "not_updated",
+      jsonCommitted: false,
+      htmlUpdated: false,
+      errorCode: expect.stringMatching(/^invalid_report_/),
+    });
+    expect(readFileSync(first.files.json, "utf8")).toBe(corrupted);
+    const replan = savedSession(cwd, sessionDir);
+    expect(
+      await runtime(replan).link({
+        operation: "begin_planning",
+        displayName: "No invalid saved proof",
+        sourceIssues: [issue1],
+      }),
+    ).toMatchObject({
+      status: "rejected",
+      errorCode: "planning_source_issues_unresolved",
+    });
+  },
+);
+
+test("taskflow-evaluate preserves structured Review and approval Tool results as raw observations", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Review observations",
+    }),
+  );
+  const file = manager.getSessionFile()!;
+  const beforeEntries = manager.getEntries();
+  let parentId = beforeEntries.at(-1)!.id;
+  for (const [index, toolName] of [
+    "taskflow_plan_review",
+    "taskflow_code_review",
+  ].entries()) {
+    const entryId = `review-result-${index}`;
+    appendFileSync(
+      file,
+      `${JSON.stringify({ type: "message", id: entryId, parentId, timestamp: new Date().toISOString(), message: { role: "toolResult", toolName, toolCallId: `review-call-${index}`, isError: false, timestamp: Date.now(), content: [{ type: "text", text: "Review result recorded" }], details: { status: "approved", approved: true, findings: [{ severity: "info", text: "Checked <script>payload</script>" }], data: { reviewer: "public Tool observation" }, token: "REVIEW SECRET", thinking: "REVIEW THINKING", signature: "REVIEW SIGNATURE", image: { type: "image", data: "REVIEW BASE64" } } } })}\n`,
+    );
+    parentId = entryId;
+  }
+  const source = readFileSync(file);
+  const receipt = await app.list(`--taskflow ${id}`);
+  expect(receipt).toMatchObject({ jsonCommitted: true, htmlUpdated: true });
+  const report = JSON.parse(readFileSync(receipt.files.json, "utf8"));
+  for (const index of [0, 1])
+    expect(report.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "tool_result",
+          provenance: expect.objectContaining({
+            entryId: `review-result-${index}`,
+            field: "message.details",
+          }),
+          value: expect.objectContaining({
+            status: "approved",
+            approved: true,
+            findings: [
+              { severity: "info", text: "Checked <script>payload</script>" },
+            ],
+            data: { reviewer: "public Tool observation" },
+          }),
+        }),
+      ]),
+    );
+  expect(
+    report.observations.filter(
+      (observation: { kind: string }) => observation.kind === "exit",
+    ),
+  ).toEqual([]);
+  const json = readFileSync(receipt.files.json, "utf8");
+  for (const secret of [
+    "REVIEW SECRET",
+    "REVIEW THINKING",
+    "REVIEW SIGNATURE",
+    "REVIEW BASE64",
+  ])
+    expect(json).not.toContain(secret);
+  expect(readFileSync(receipt.files.html, "utf8")).toContain(
+    "&lt;script&gt;payload&lt;/script&gt;",
+  );
+  expect(readFileSync(file)).toEqual(source);
+});
+
+test("taskflow-evaluate JSON and HTML connect Planning and each Issue to its Root runs and individual missing records", async () => {
+  const { cwd, sessionDir } = workspace();
+  const planning = savedSession(cwd, sessionDir);
+  const app = runtime(planning);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Issue navigation",
+    }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1, issue2] });
+  const implementations = [
+    savedSession(cwd, sessionDir),
+    savedSession(cwd, sessionDir),
+  ];
+  await Promise.all(
+    implementations.map((manager) =>
+      runtime(manager).link({ operation: "implementation", issue: issue1 }),
+    ),
+  );
+  const receipt = await app.list(issue1);
+  expect(receipt).toMatchObject({ taskflowId: id, jsonCommitted: true });
+  const report = JSON.parse(readFileSync(receipt.files.json, "utf8"));
+  expect(report.planningSessionIds).toEqual([planning.getSessionId()]);
+  expect(report.issues).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        issue: expect.objectContaining({ number: 1 }),
+        implementationSessionIds: expect.arrayContaining(
+          implementations.map((manager) => manager.getSessionId()),
+        ),
+      }),
+      expect.objectContaining({
+        issue: expect.objectContaining({ number: 2 }),
+        implementationSessionIds: [],
+      }),
+    ]),
+  );
+  const page = readFileSync(receipt.files.html, "utf8");
+  for (const manager of implementations) {
+    const rootIndex = report.roots.findIndex(
+      (root: { sessionId: string }) =>
+        root.sessionId === manager.getSessionId(),
+    );
+    expect(
+      page.slice(page.indexOf('id="issue-0"'), page.indexOf('id="issue-1"')),
+    ).toContain(`href="#root-${rootIndex}"`);
+  }
+  expect(
+    page.slice(page.indexOf('id="issue-1"'), page.indexOf('id="roots"')),
+  ).toContain("実行記録が見つからない");
+});
+
+test("taskflow-evaluate keeps valid links when Tool details are unsupported and redacts prefixed token keys", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Details boundary",
+    }),
+  );
+  let parentId = manager.getEntries().at(-1)!.id;
+  let deep: unknown = "DEEP_JSON_PAYLOAD_NOT_ACQUIRED";
+  for (let index = 0; index < 35; index++) deep = { nested: deep };
+  for (const [index, details] of [
+    deep,
+    {
+      githubToken: "PREFIXED TOKEN SECRET",
+      access_token: "ACCESS TOKEN SECRET",
+      status: "reported",
+      totalTokens: 12,
+    },
+  ].entries()) {
+    const entryId = `details-${index}`;
+    appendFileSync(
+      manager.getSessionFile()!,
+      `${JSON.stringify({ type: "message", id: entryId, parentId, timestamp: new Date().toISOString(), message: { role: "toolResult", toolName: "taskflow_code_review", toolCallId: entryId, timestamp: Date.now(), isError: false, content: [{ type: "text", text: "Raw result" }], details } })}\n`,
+    );
+    parentId = entryId;
+  }
+  const receipt = await app.list(`--taskflow ${id}`);
+  expect(receipt.jsonCommitted).toBe(true);
+  const json = readFileSync(receipt.files.json, "utf8");
+  expect(json).not.toContain("PREFIXED TOKEN SECRET");
+  expect(json).not.toContain("ACCESS TOKEN SECRET");
+  expect(json).not.toContain("DEEP_JSON_PAYLOAD_NOT_ACQUIRED");
+  expect(json).toContain("unsupported_evidence:details-0:message.details");
+  expect(json).toContain('"totalTokens": 12');
+});
+
+test("taskflow-evaluate unsupported deeply nested ToolCall evidence preserves valid explicit membership", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Deep call evidence",
+    }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  let args: unknown = "DEEP_ARGUMENT_NOT_ACQUIRED";
+  for (let index = 0; index < 32; index++) args = { nested: args };
+  const file = manager.getSessionFile()!;
+  appendFileSync(
+    file,
+    `${JSON.stringify({ type: "message", id: "deep-tool-call", parentId: manager.getEntries().at(-1)!.id, timestamp: new Date().toISOString(), message: { role: "assistant", timestamp: Date.now(), content: [{ type: "toolCall", id: "deep-call", name: "review", arguments: args }] } })}\n`,
+  );
+  const before = readFileSync(file);
+  const listing = await app.list();
+  expect(listing).toMatchObject({
+    complete: true,
+    candidates: [expect.objectContaining({ taskflowId: id })],
+  });
+  expect(listing.sourceWarnings).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        warnings: expect.arrayContaining([
+          "unsupported_evidence:deep-tool-call:message.content.0",
+        ]),
+      }),
+    ]),
+  );
+  const replan = savedSession(cwd, sessionDir);
+  expect(
+    await runtime(replan).link({
+      operation: "begin_planning",
+      displayName: "Known ownership",
+      sourceIssues: [issue1],
+    }),
+  ).toMatchObject({ status: "saved", taskflowId: id });
+  const receipt = await app.list(`--taskflow ${id}`);
+  expect(receipt).toMatchObject({ jsonCommitted: true, htmlUpdated: true });
+  expect(readFileSync(receipt.files.json, "utf8")).not.toContain(
+    "DEEP_ARGUMENT_NOT_ACQUIRED",
+  );
+  expect(readFileSync(file)).toEqual(before);
+});
+
+test.each(["lower", "raise"] as const)(
+  "taskflow-evaluate %s excerpt limit retains the most complete immutable evidence after source loss",
+  async (change) => {
+    const { cwd, sessionDir } = workspace();
+    const manager = savedSession(cwd, sessionDir);
+    const text = "e".repeat(5000);
+    manager.appendMessage({
+      role: "user",
+      content: text,
+      timestamp: Date.now(),
+    });
+    let limits = change === "raise" ? { maxExcerptKiB: 1 } : {};
+    const app = runtime(manager, {
+      settings: () => ({ "taskflow-evaluation": { limits } }),
+    });
+    const id = resultTaskflowId(
+      await app.link({
+        operation: "begin_planning",
+        displayName: "Excerpt preservation",
+      }),
+    );
+    const first = await app.list(`--taskflow ${id}`);
+    const initial = JSON.parse(readFileSync(first.files.json, "utf8"));
+    const evidence = initial.observations.find(
+      (o: { value: unknown }) =>
+        typeof o.value === "string" && o.value.startsWith("eeee"),
+    );
+    expect(evidence.value.length).toBe(change === "raise" ? 1024 : 5000);
+    limits = { maxExcerptKiB: change === "raise" ? 8 : 1 };
+    expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+    let report = JSON.parse(readFileSync(first.files.json, "utf8"));
+    expect(
+      report.observations.find((o: { key: string }) => o.key === evidence.key),
+    ).toMatchObject({
+      value: text,
+      sourceDigest: evidence.sourceDigest,
+      shortened: false,
+    });
+    rmSync(manager.getSessionFile()!);
+    expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+    report = JSON.parse(readFileSync(first.files.json, "utf8"));
+    expect(
+      report.observations.find((o: { key: string }) => o.key === evidence.key)
+        .value,
+    ).toBe(text);
+  },
+);
+
+test("taskflow-evaluate saved begin conflicts cannot erase one owner and make another unique", async () => {
+  const { cwd, sessionDir } = workspace();
+  const first = savedSession(cwd, sessionDir);
+  const app = runtime(first);
+  const a = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Owner A" }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  expect((await app.list(`--taskflow ${a}`)).jsonCommitted).toBe(true);
+  const second = runtime(savedSession(cwd, sessionDir));
+  const b = resultTaskflowId(
+    await second.link({ operation: "begin_planning", displayName: "Owner B" }),
+  );
+  await second.link({ operation: "add_issues", issues: [issue1] });
+  const unrelated = runtime(savedSession(cwd, sessionDir));
+  const c = resultTaskflowId(
+    await unrelated.link({
+      operation: "begin_planning",
+      displayName: "Unrelated",
+    }),
+  );
+  await unrelated.link({ operation: "add_issues", issues: [issue2] });
+  writeFileSync(
+    first.getSessionFile()!,
+    readFileSync(first.getSessionFile()!, "utf8").replace(
+      '"displayName":"Owner A"',
+      '"displayName":"Changed Owner A"',
+    ),
+  );
+  const listing = await app.list();
+  expect(listing.complete).toBe(true);
+  expect(listing.conflicts).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ taskflowIds: expect.arrayContaining([a, b]) }),
+    ]),
+  );
+  expect(await app.list(issue1)).toMatchObject({
+    status: "not_updated",
+    errorCode: "target_not_unique",
+    jsonCommitted: false,
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "No guess",
+      sourceIssues: [issue1],
+    }),
+  ).toMatchObject({
+    status: "rejected",
+    errorCode: "planning_source_issues_unresolved",
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "Known other Issue",
+      sourceIssues: [issue2],
+    }),
+  ).toMatchObject({ status: "saved", taskflowId: c });
+});
+
+test("taskflow-evaluate latest report follows source assistant entry order rather than conflict insertion order", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Latest source report",
+    }),
+  );
+  const assistant = {
+    role: "assistant" as const,
+    api: "anthropic-messages" as const,
+    provider: "test",
+    model: "fixture",
+    stopReason: "stop" as const,
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  };
+  const earlier = manager.appendMessage({
+    ...assistant,
+    content: [{ type: "text", text: "E1 earlier report" }],
+    timestamp: Date.now() + 1000,
+  });
+  const latest = manager.appendMessage({
+    ...assistant,
+    content: [{ type: "text", text: "E2 latest report" }],
+    timestamp: Date.now(),
+  });
+  const first = await app.list(`--taskflow ${id}`);
+  const initial = JSON.parse(readFileSync(first.files.json, "utf8"));
+  const latestKey = initial.observations.find(
+    (o: { provenance: { entryId: string }; kind: string }) =>
+      o.kind === "report" && o.provenance.entryId === latest,
+  ).key;
+  writeFileSync(
+    manager.getSessionFile()!,
+    readFileSync(manager.getSessionFile()!, "utf8").replace(
+      "E1 earlier report",
+      "E1 modified report",
+    ),
+  );
+  expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+  let report = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(report.roots[0].latestReportKey).toBe(latestKey);
+  expect(
+    report.observations
+      .filter(
+        (o: { kind: string; provenance: { entryId: string } }) =>
+          o.kind === "report" && o.provenance.entryId === earlier,
+      )
+      .map((o: { value: string }) => o.value),
+  ).toEqual(["E1 earlier report", "E1 modified report"]);
+  expect(report.conflicts).toEqual(
+    expect.arrayContaining([expect.stringContaining(earlier)]),
+  );
+  rmSync(manager.getSessionFile()!);
+  expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+  report = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(report.roots[0].latestReportKey).toBe(latestKey);
+});
+
+test("taskflow-evaluate records public SDK context_edit content and null with raw provenance without tree quarantine", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const target = manager.getEntries()[0].id;
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Context edits",
+    }),
+  );
+  const stringEdit = manager.appendContextEdit(target, {
+    content: "Edited string",
+  });
+  const blocksEdit = manager.appendContextEdit(target, {
+    content: [
+      { type: "text", text: "Edited block", textSignature: "EDIT SIGNATURE" },
+      { type: "image", data: "EDIT IMAGE", mimeType: "image/png" },
+    ],
+  });
+  const nullEdit = manager.appendContextEdit(target, null);
+  const source = readFileSync(manager.getSessionFile()!);
+  const first = await app.list(`--taskflow ${id}`);
+  expect(first.jsonCommitted).toBe(true);
+  const report = JSON.parse(readFileSync(first.files.json, "utf8"));
+  expect(report.roots[0].quarantine).toEqual([]);
+  for (const [entryId, field, value] of [
+    [stringEdit, "replacement.content", "Edited string"],
+    [blocksEdit, "replacement.content.0.text", "Edited block"],
+    [nullEdit, "replacement", null],
+  ]) {
+    expect(report.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "context_edit",
+          provenance: expect.objectContaining({ entryId, field }),
+          value,
+        }),
+      ]),
+    );
+    expect(report.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "context_edit",
+          provenance: expect.objectContaining({ entryId, field: "targetId" }),
+          value: target,
+        }),
+      ]),
+    );
+  }
+  const json = readFileSync(first.files.json, "utf8");
+  expect(json).not.toContain("EDIT SIGNATURE");
+  expect(json).not.toContain("EDIT IMAGE");
+  expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+  expect(readFileSync(manager.getSessionFile()!)).toEqual(source);
+});
+
+test("taskflow-evaluate includes related cross-Taskflow Issue ownership conflicts in JSON and HTML", async () => {
+  const { cwd, sessionDir } = workspace();
+  const app = runtime(savedSession(cwd, sessionDir));
+  const a = resultTaskflowId(
+    await app.link({ operation: "begin_planning", displayName: "Conflict A" }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  const other = runtime(savedSession(cwd, sessionDir));
+  const b = resultTaskflowId(
+    await other.link({
+      operation: "begin_planning",
+      displayName: "Conflict B",
+    }),
+  );
+  await other.link({ operation: "add_issues", issues: [issue1] });
+  const listing = await app.list();
+  expect(listing.conflicts).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ taskflowIds: expect.arrayContaining([a, b]) }),
+    ]),
+  );
+  const receipt = await app.list(`--taskflow ${a}`);
+  expect(receipt.jsonCommitted).toBe(true);
+  const report = JSON.parse(readFileSync(receipt.files.json, "utf8"));
+  expect(report.conflicts).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining("explicit_issue_ownership_conflict"),
+    ]),
+  );
+  expect(report.conflicts.join(" ")).toContain(b);
+  expect(report.conflicts.join(" ")).toContain('"number":1');
+  const page = readFileSync(receipt.files.html, "utf8");
+  expect(page).toContain("explicit_issue_ownership_conflict");
+  expect(page).toContain(b);
+});
+
+test("taskflow-evaluate conflicting add_issues evidence affects only its concrete Issue references", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Scoped evidence conflict",
+    }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  await app.link({ operation: "add_issues", issues: [issue2] });
+  expect((await app.list(`--taskflow ${id}`)).jsonCommitted).toBe(true);
+  writeFileSync(
+    manager.getSessionFile()!,
+    readFileSync(manager.getSessionFile()!, "utf8").replace(
+      '"number":1',
+      '"number":3',
+    ),
+  );
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "Conflicted Issue",
+      sourceIssues: [issue1],
+    }),
+  ).toMatchObject({
+    status: "rejected",
+    errorCode: "planning_source_issues_unresolved",
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "Unaffected Issue",
+      sourceIssues: [issue2],
+    }),
+  ).toMatchObject({ status: "saved", taskflowId: id });
+});
+
+test("taskflow-evaluate same-entry add_issues to identical begin variant cannot uniquely reuse its Issue", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const id = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Cross-operation proof",
+    }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  await app.link({ operation: "add_issues", issues: [issue2] });
+  const first = await app.list(`--taskflow ${id}`);
+  const oldJson = readFileSync(first.files.json);
+  const oldHtml = readFileSync(first.files.html);
+  const file = manager.getSessionFile()!;
+  const entries = readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const begin = entries.find(
+    (entry) =>
+      entry.type === "custom" && entry.data.operation === "begin_planning",
+  );
+  const addition = entries.find(
+    (entry) => entry.type === "custom" && entry.data.operation === "add_issues",
+  );
+  addition.data = begin.data;
+  writeFileSync(
+    file,
+    entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+  );
+  const source = readFileSync(file);
+  expect((await app.list()).complete).toBe(true);
+  expect(await app.list(issue1)).toMatchObject({
+    status: "not_updated",
+    errorCode: "target_not_unique",
+    jsonCommitted: false,
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "No changed operation reuse",
+      sourceIssues: [issue1],
+    }),
+  ).toMatchObject({
+    status: "rejected",
+    errorCode: "planning_source_issues_unresolved",
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "Independent Issue proof",
+      sourceIssues: [issue2],
+    }),
+  ).toMatchObject({ status: "saved", taskflowId: id });
+  expect(readFileSync(first.files.json)).toEqual(oldJson);
+  expect(readFileSync(first.files.html)).toEqual(oldHtml);
+  expect(readFileSync(file)).toEqual(source);
+});
+
+test("taskflow-evaluate current legacy begin variant cannot remove saved valid ownership or promote legacy refs", async () => {
+  const { cwd, sessionDir } = workspace();
+  const manager = savedSession(cwd, sessionDir);
+  const app = runtime(manager);
+  const a = resultTaskflowId(
+    await app.link({
+      operation: "begin_planning",
+      displayName: "Saved explicit A",
+    }),
+  );
+  await app.link({ operation: "add_issues", issues: [issue1] });
+  const first = await app.list(`--taskflow ${a}`);
+  const oldJson = readFileSync(first.files.json);
+  const oldHtml = readFileSync(first.files.html);
+  const other = runtime(savedSession(cwd, sessionDir));
+  const b = resultTaskflowId(
+    await other.link({
+      operation: "begin_planning",
+      displayName: "Independent B",
+    }),
+  );
+  await other.link({ operation: "add_issues", issues: [issue1] });
+  const unrelated = runtime(savedSession(cwd, sessionDir));
+  const c = resultTaskflowId(
+    await unrelated.link({
+      operation: "begin_planning",
+      displayName: "Known unrelated C",
+    }),
+  );
+  await unrelated.link({ operation: "add_issues", issues: [issue2] });
+  const file = manager.getSessionFile()!;
+  const entries = readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const begin = entries.find(
+    (entry) =>
+      entry.type === "custom" && entry.data.operation === "begin_planning",
+  );
+  delete begin.data.taskflowId;
+  begin.data.unresolved = "source_issues_unresolved";
+  begin.data.sourceIssues = [1, 2].map((number) => ({
+    kind: "github",
+    host: "github.com",
+    owner: "example",
+    repo: "project",
+    number,
+  }));
+  writeFileSync(
+    file,
+    entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+  );
+  const source = readFileSync(file);
+  const listing = await app.list();
+  expect(listing.complete).toBe(true);
+  expect(listing.conflicts).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ taskflowIds: expect.arrayContaining([a, b]) }),
+    ]),
+  );
+  expect(await app.list(issue1)).toMatchObject({
+    status: "not_updated",
+    errorCode: "target_not_unique",
+    jsonCommitted: false,
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "No legacy variant reuse",
+      sourceIssues: [issue1],
+    }),
+  ).toMatchObject({
+    status: "rejected",
+    errorCode: "planning_source_issues_unresolved",
+  });
+  expect(
+    await runtime(savedSession(cwd, sessionDir)).link({
+      operation: "begin_planning",
+      displayName: "Legacy ref is not membership",
+      sourceIssues: [issue2],
+    }),
+  ).toMatchObject({ status: "saved", taskflowId: c });
+  expect(readFileSync(first.files.json)).toEqual(oldJson);
+  expect(readFileSync(first.files.html)).toEqual(oldHtml);
+  expect(readFileSync(file)).toEqual(source);
 });

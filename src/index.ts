@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { collectReport } from "./report.js";
+import { savedReports, withSaved } from "./saved.js";
 import { existsSync } from "node:fs";
 import { Writable } from "node:stream";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,6 +20,7 @@ import {
   candidateList,
   discover,
   ownership,
+  membershipIndex,
   readRun,
   runConflict,
 } from "./discovery.js";
@@ -159,12 +162,21 @@ export default function taskflowEvaluation(pi: ExtensionAPI) {
               throw new Error("planning_switch_refused");
             data = begin;
           } else {
-            const taskflowId = input.sourceIssues
-              ? ownership(
-                  discover(manager.getSessionDir(), ctx.cwd, limits, budget),
-                  input.sourceIssues,
-                )
-              : randomUUID();
+            let taskflowId: string | undefined;
+            if (input.sourceIssues) {
+              const saved = savedReports(
+                ctx.cwd,
+                manager.getSessionDir(),
+                limits,
+                budget,
+              );
+              const scan = withSaved(
+                discover(manager.getSessionDir(), ctx.cwd, limits, budget),
+                saved.reports,
+                saved.errors.length > 0,
+              );
+              taskflowId = ownership(scan, input.sourceIssues);
+            } else taskflowId = randomUUID();
             if (!taskflowId)
               throw new Error("planning_source_issues_unresolved");
             data = {
@@ -291,31 +303,49 @@ export default function taskflowEvaluation(pi: ExtensionAPI) {
   });
   pi.registerCommand("taskflow-evaluate", {
     description:
-      "List recorded Taskflow candidates in the current cwd/Session directory (no model or reports).",
+      "Select a Taskflow and collect read-only Root evidence into private JSON/HTML reports; --list never writes reports.",
     async handler(args, ctx) {
       let receipt: object;
       try {
         const limits = limitsSnapshot(pi.getSettings());
         await ctx.waitForIdle();
-        if (args.trim() !== "--list") {
+        const budget = { bytes: 0 };
+        const sessionDir = ctx.sessionManager.getSessionDir();
+        const saved = savedReports(ctx.cwd, sessionDir, limits, budget);
+        const live = discover(sessionDir, ctx.cwd, limits, budget);
+        const current = live.runs.find(
+          (run) => run.sessionId === ctx.sessionManager.getSessionId(),
+        );
+        if (current && current.lastEntryId !== ctx.sessionManager.getLeafId())
+          current.warnings.push("current_leaf_mismatch");
+        const scan = withSaved(live, saved.reports, saved.errors.length > 0);
+        const membership = membershipIndex(scan);
+        const listing = candidateList(scan, membership);
+        const listReceipt = {
+          ...listing,
+          detectedQuarantine: live.quarantines ?? [],
+          jsonCommitted: false,
+          htmlUpdated: false,
+          complete: scan.complete,
+          warnings: [
+            ...scan.warnings,
+            ...saved.errors.map(({ taskflowId, error }) => ({
+              code: error.code,
+              taskflowId,
+              key: error.key,
+              value: error.value,
+              resume: error.key
+                ? `Change taskflow-evaluation.limits.${error.key}, /reload, then retry; saved evidence was not discarded.`
+                : "Restore a valid private canonical report before retrying; no empty fallback.",
+            })),
+          ],
+          effectiveLimits: limits,
+          scope: { cwd: ctx.cwd, sessionDir },
+        };
+        if (args.trim() === "--list") {
           receipt = {
-            status: "not_updated",
-            errorCode: "list_only",
-            resume:
-              "Use /taskflow-evaluate --list; report generation is not implemented in W1.",
-          };
-        } else {
-          const scan = discover(
-            ctx.sessionManager.getSessionDir(),
-            ctx.cwd,
-            limits,
-            { bytes: 0 },
-          );
-          receipt = {
+            ...listReceipt,
             status: "listed",
-            ...candidateList(scan),
-            complete: scan.complete,
-            warnings: scan.warnings,
             sourceWarnings: scan.runs
               .filter((run) => run.warnings.length)
               .map((run) => ({
@@ -330,15 +360,76 @@ export default function taskflowEvaluation(pi: ExtensionAPI) {
             limitations: [
               "Uniqueness is only within current cwd/top-level Session directory; outside-scope conflicts are unknown.",
               "Unrecorded tree navigation cannot be reconstructed.",
-              "Reports/saved report membership (W2), child evidence (W3), Taskflow Skill integration (W4) are not implemented.",
+              "Child bodies (W3) and Taskflow Skill integration (W4) are not implemented.",
               "Missing Implementation records do not prove work was not performed.",
             ],
           };
+        } else {
+          const input = args.trim();
+          let candidate: (typeof listing.candidates)[number] | undefined;
+          let cancelled = false;
+          let selectionError = "target_not_unique";
+          if (
+            !input &&
+            ctx.hasUI &&
+            scan.complete &&
+            listing.candidates.length
+          ) {
+            const choices = listing.candidates.map(
+              (item) =>
+                `${item.displayName} | ${item.issues.map(issueKey).join(", ")} | ${item.planningTimestamps.join(", ")} | ${item.taskflowId}`,
+            );
+            const choice = await ctx.ui.select(
+              "Taskflow を選択（取消は保存しません）",
+              choices,
+            );
+            cancelled = choice === undefined;
+            candidate = listing.candidates[choices.indexOf(choice ?? "")];
+          } else if (input.startsWith("--taskflow "))
+            candidate = listing.candidates.find(
+              (item) => item.taskflowId === input.slice(11).trim(),
+            );
+          else if (input) {
+            const issue = normalizeIssue(input, ctx.cwd);
+            const id = membership.resolve([issue]);
+            candidate = listing.candidates.find(
+              (item) => item.taskflowId === id,
+            );
+          } else selectionError = "target_required";
+          if (saved.errors.length) selectionError = saved.errors[0].error.code;
+          else if (!scan.complete) selectionError = "discovery_incomplete";
+          receipt = cancelled
+            ? { ...listReceipt, status: "cancelled" }
+            : candidate && scan.complete
+              ? collectReport(
+                  candidate.taskflowId,
+                  candidate.displayName,
+                  ctx.cwd,
+                  sessionDir,
+                  scan,
+                  live,
+                  limits,
+                  budget,
+                  candidate,
+                  listing.conflicts,
+                )
+              : {
+                  ...listReceipt,
+                  status: "not_updated",
+                  errorCode: selectionError,
+                  resume:
+                    "Select a unique explicit Issue or --taskflow UUID after correcting acquisition/schema limits; no report or pending state was created.",
+                };
         }
       } catch (error) {
-        receipt = { status: "not_updated", errorCode: errorCode(error) };
+        receipt = {
+          status: "not_updated",
+          errorCode: errorCode(error),
+          jsonCommitted: false,
+          htmlUpdated: false,
+        };
       }
-      const text = `TASKFLOW_EVALUATION_RESULT ${JSON.stringify({ ...receipt, jsonCommitted: false, htmlUpdated: false })}`;
+      const text = `TASKFLOW_EVALUATION_RESULT ${JSON.stringify(receipt)}`;
       if (ctx.hasUI) ctx.ui.notify(text, "info");
       else {
         // Bypass Pi's instance write redirect without taking ownership of stdout.
